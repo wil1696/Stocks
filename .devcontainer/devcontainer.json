@@ -1,0 +1,11 @@
+{
+  "name": "Stocks Dashboard",
+  "postStartCommand": "cd /workspaces/Stocks && streamlit run dashboard.py --server.headless true &",
+  "forwardPorts": [8501],
+  "portsAttributes": {
+    "8501": {
+      "label": "Streamlit Dashboard",
+      "onAutoForward": "openBrowserOnce"
+    }
+  }
+}
