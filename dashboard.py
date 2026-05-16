@@ -1015,132 +1015,131 @@ with tab5:
 
     if holdings.empty:
         st.info("No holdings yet. Add your first position using the form above.")
-        st.stop()
-
-    # ── Enrich with current prices and signals ────────────────────────────────
-    rows = []
-    for _, h in holdings.iterrows():
-        t         = h["ticker"]
-        h_shares  = float(h["shares"])
-        h_cost    = float(h["avg_cost"])
-        cost_basis = h_shares * h_cost
-
-        # Current price — latest available in stock_prices
-        price_res = (
-            get_client().table("stock_prices")
-            .select("close, date")
-            .eq("ticker", t)
-            .order("date", desc=True)
-            .limit(1)
-            .execute()
+    else:
+        # ── Enrich with current prices and signals ────────────────────────────
+        rows = []
+        for _, h in holdings.iterrows():
+            t         = h["ticker"]
+            h_shares  = float(h["shares"])
+            h_cost    = float(h["avg_cost"])
+            cost_basis = h_shares * h_cost
+    
+            # Current price — latest available in stock_prices
+            price_res = (
+                get_client().table("stock_prices")
+                .select("close, date")
+                .eq("ticker", t)
+                .order("date", desc=True)
+                .limit(1)
+                .execute()
+            )
+            curr_price = float(price_res.data[0]["close"]) if price_res.data else None
+    
+            mkt_value  = (curr_price * h_shares)           if curr_price else None
+            gain_abs   = (mkt_value - cost_basis)           if mkt_value else None
+            gain_pct   = (gain_abs / cost_basis * 100)      if gain_abs is not None else None
+    
+            # Quick signal: compare PE to historical average PE
+            snap_h    = load_snapshot(t)
+            signal_h  = "N/A"
+            if snap_h:
+                inc_a   = load_annual_income(t)
+                bal_a   = load_annual_balance(t)
+                pr_all  = load_all_prices(t)
+                h_avgs  = compute_historical_multiples(inc_a, bal_a, pr_all)
+                m_imp   = multiples_implied_prices(snap_h, h_avgs)
+                est_h   = {k: m_imp.get(v) for k, v in
+                           [("P/E Multiple","pe_implied"),("EV/EBITDA","ev_ebitda_implied"),
+                            ("P/S Multiple","ps_implied")]}
+                sum_h   = valuation_summary(curr_price or snap_h.get("price") or 0,
+                                            est_h, mos=0.15,
+                                            active_methods={"P/E Multiple","EV/EBITDA","P/S Multiple"})
+                signal_h = sum_h.get("signal", "N/A")
+    
+            rows.append({
+                "Ticker":        t,
+                "Shares":        h_shares,
+                "Avg Cost":      h_cost,
+                "Current Price": curr_price,
+                "Market Value":  mkt_value,
+                "Gain / Loss $": gain_abs,
+                "Gain / Loss %": gain_pct,
+                "Signal":        signal_h,
+                "Notes":         h.get("notes", ""),
+            })
+    
+        df_port = pd.DataFrame(rows)
+    
+        # ── Holdings table ────────────────────────────────────────────────────────
+        st.subheader("Holdings")
+        st.caption(
+            "Signal uses P/E, EV/EBITDA, and P/S multiples vs 5-year historical averages "
+            "with a 15% margin of safety. For a full analysis, open the 📐 Valuation tab."
         )
-        curr_price = float(price_res.data[0]["close"]) if price_res.data else None
-
-        mkt_value  = (curr_price * h_shares)           if curr_price else None
-        gain_abs   = (mkt_value - cost_basis)           if mkt_value else None
-        gain_pct   = (gain_abs / cost_basis * 100)      if gain_abs is not None else None
-
-        # Quick signal: compare PE to historical average PE
-        snap_h    = load_snapshot(t)
-        signal_h  = "N/A"
-        if snap_h:
-            inc_a   = load_annual_income(t)
-            bal_a   = load_annual_balance(t)
-            pr_all  = load_all_prices(t)
-            h_avgs  = compute_historical_multiples(inc_a, bal_a, pr_all)
-            m_imp   = multiples_implied_prices(snap_h, h_avgs)
-            est_h   = {k: m_imp.get(v) for k, v in
-                       [("P/E Multiple","pe_implied"),("EV/EBITDA","ev_ebitda_implied"),
-                        ("P/S Multiple","ps_implied")]}
-            sum_h   = valuation_summary(curr_price or snap_h.get("price") or 0,
-                                        est_h, mos=0.15,
-                                        active_methods={"P/E Multiple","EV/EBITDA","P/S Multiple"})
-            signal_h = sum_h.get("signal", "N/A")
-
-        rows.append({
-            "Ticker":        t,
-            "Shares":        h_shares,
-            "Avg Cost":      h_cost,
-            "Current Price": curr_price,
-            "Market Value":  mkt_value,
-            "Gain / Loss $": gain_abs,
-            "Gain / Loss %": gain_pct,
-            "Signal":        signal_h,
-            "Notes":         h.get("notes", ""),
-        })
-
-    df_port = pd.DataFrame(rows)
-
-    # ── Holdings table ────────────────────────────────────────────────────────
-    st.subheader("Holdings")
-    st.caption(
-        "Signal uses P/E, EV/EBITDA, and P/S multiples vs 5-year historical averages "
-        "with a 15% margin of safety. For a full analysis, open the 📐 Valuation tab."
-    )
-
-    SIGNAL_ICONS = {
-        "Undervalued":       "✅ Undervalued",
-        "Fairly Valued":     "⚖️ Fairly Valued",
-        "Overvalued":        "🔴 Overvalued",
-        "Insufficient Data": "❓ Insufficient Data",
-        "N/A":               "—",
-    }
-
-    def fmt_cell(v, fmt="$"):
-        if v is None:
-            return "N/A"
-        if fmt == "$":
-            return f"${v:,.2f}"
-        if fmt == "%":
-            return f"{v:+.2f}%"
-        return str(v)
-
-    for _, r in df_port.iterrows():
-        gc = GREEN if (r["Gain / Loss $"] or 0) >= 0 else RED
-        sig_label = SIGNAL_ICONS.get(r["Signal"], r["Signal"])
-
-        col_a, col_b, col_c, col_d, col_e, col_f, col_g = st.columns([1,1,1,1,1.2,1.2,1.5])
-        col_a.markdown(f"**{r['Ticker']}**")
-        col_b.markdown(fmt_cell(r["Shares"],        fmt=""))
-        col_c.markdown(fmt_cell(r["Avg Cost"],      fmt="$"))
-        col_d.markdown(fmt_cell(r["Current Price"], fmt="$"))
-        col_e.markdown(fmt_cell(r["Market Value"],  fmt="$"))
-        col_f.markdown(f'<span style="color:{gc}">{fmt_cell(r["Gain / Loss $"],"$")} '
-                       f'({fmt_cell(r["Gain / Loss %"],"%")})</span>',
-                       unsafe_allow_html=True)
-        col_g.markdown(sig_label)
-
-        # Delete button
-        if st.button(f"🗑 Remove {r['Ticker']}", key=f"del_{r['Ticker']}"):
-            delete_holding(r["Ticker"])
-            st.rerun()
-        st.divider()
-
-    # ── Portfolio summary ─────────────────────────────────────────────────────
-    st.subheader("Portfolio Summary")
-    st.caption("Based on latest available prices in the database.")
-
-    valid        = df_port.dropna(subset=["Market Value"])
-    total_cost   = (df_port["Shares"] * df_port["Avg Cost"]).sum()
-    total_value  = valid["Market Value"].sum()
-    total_gain   = total_value - (valid["Shares"] * valid["Avg Cost"]).sum()
-    total_gain_p = (total_gain / (valid["Shares"] * valid["Avg Cost"]).sum() * 100) if total_cost else 0
-
-    ps1, ps2, ps3, ps4 = st.columns(4)
-    with ps1: stat_card("Total Cost Basis", fmt_large(total_cost))
-    with ps2: stat_card("Current Value",    fmt_large(total_value))
-    gc_port = "green" if total_gain >= 0 else "red"
-    with ps3: stat_card("Total Gain / Loss",
-                        f'<span style="color:{"#00d084" if total_gain >= 0 else "#ff4b4b"}">'
-                        f'{fmt_large(abs(total_gain))}</span>',
-                        f'{"+" if total_gain >= 0 else "-"}{abs(total_gain_p):.2f}%', gc_port)
-    with ps4:
-        signal_counts = df_port["Signal"].value_counts().to_dict()
-        dominant = max(signal_counts, key=signal_counts.get) if signal_counts else "N/A"
-        cfg_p    = SIGNAL_CONFIG.get(dominant, SIGNAL_CONFIG["Insufficient Data"])
-        stat_card("Portfolio Signal",
-                  f'{cfg_p["icon"]} {dominant}',
-                  f"({signal_counts.get(dominant,0)} of {len(df_port)} positions)")
+    
+        SIGNAL_ICONS = {
+            "Undervalued":       "✅ Undervalued",
+            "Fairly Valued":     "⚖️ Fairly Valued",
+            "Overvalued":        "🔴 Overvalued",
+            "Insufficient Data": "❓ Insufficient Data",
+            "N/A":               "—",
+        }
+    
+        def fmt_cell(v, fmt="$"):
+            if v is None:
+                return "N/A"
+            if fmt == "$":
+                return f"${v:,.2f}"
+            if fmt == "%":
+                return f"{v:+.2f}%"
+            return str(v)
+    
+        for _, r in df_port.iterrows():
+            gc = GREEN if (r["Gain / Loss $"] or 0) >= 0 else RED
+            sig_label = SIGNAL_ICONS.get(r["Signal"], r["Signal"])
+    
+            col_a, col_b, col_c, col_d, col_e, col_f, col_g = st.columns([1,1,1,1,1.2,1.2,1.5])
+            col_a.markdown(f"**{r['Ticker']}**")
+            col_b.markdown(fmt_cell(r["Shares"],        fmt=""))
+            col_c.markdown(fmt_cell(r["Avg Cost"],      fmt="$"))
+            col_d.markdown(fmt_cell(r["Current Price"], fmt="$"))
+            col_e.markdown(fmt_cell(r["Market Value"],  fmt="$"))
+            col_f.markdown(f'<span style="color:{gc}">{fmt_cell(r["Gain / Loss $"],"$")} '
+                           f'({fmt_cell(r["Gain / Loss %"],"%")})</span>',
+                           unsafe_allow_html=True)
+            col_g.markdown(sig_label)
+    
+            # Delete button
+            if st.button(f"🗑 Remove {r['Ticker']}", key=f"del_{r['Ticker']}"):
+                delete_holding(r["Ticker"])
+                st.rerun()
+            st.divider()
+    
+        # ── Portfolio summary ─────────────────────────────────────────────────────
+        st.subheader("Portfolio Summary")
+        st.caption("Based on latest available prices in the database.")
+    
+        valid        = df_port.dropna(subset=["Market Value"])
+        total_cost   = (df_port["Shares"] * df_port["Avg Cost"]).sum()
+        total_value  = valid["Market Value"].sum()
+        total_gain   = total_value - (valid["Shares"] * valid["Avg Cost"]).sum()
+        total_gain_p = (total_gain / (valid["Shares"] * valid["Avg Cost"]).sum() * 100) if total_cost else 0
+    
+        ps1, ps2, ps3, ps4 = st.columns(4)
+        with ps1: stat_card("Total Cost Basis", fmt_large(total_cost))
+        with ps2: stat_card("Current Value",    fmt_large(total_value))
+        gc_port = "green" if total_gain >= 0 else "red"
+        with ps3: stat_card("Total Gain / Loss",
+                            f'<span style="color:{"#00d084" if total_gain >= 0 else "#ff4b4b"}">'
+                            f'{fmt_large(abs(total_gain))}</span>',
+                            f'{"+" if total_gain >= 0 else "-"}{abs(total_gain_p):.2f}%', gc_port)
+        with ps4:
+            signal_counts = df_port["Signal"].value_counts().to_dict()
+            dominant = max(signal_counts, key=signal_counts.get) if signal_counts else "N/A"
+            cfg_p    = SIGNAL_CONFIG.get(dominant, SIGNAL_CONFIG["Insufficient Data"])
+            stat_card("Portfolio Signal",
+                      f'{cfg_p["icon"]} {dominant}',
+                      f"({signal_counts.get(dominant,0)} of {len(df_port)} positions)")
 
 
 # ════════════════════════════════════════════════════════════════════════════════

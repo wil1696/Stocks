@@ -164,133 +164,91 @@ def run_analysis(ticker_data: dict) -> str:
 # STREAMLIT TAB COMPONENT
 # ─────────────────────────────────────────────────────────────────────────────
 
+def _load_latest_analysis(ticker: str) -> dict | None:
+    """Read the most recent stored analysis for a ticker from Supabase."""
+    import os
+    from supabase import create_client
+    client = create_client(os.environ["SUPABASE_URL"], os.environ["SUPABASE_ANON_KEY"])
+    res = (
+        client.table("ai_analyses")
+        .select("*")
+        .eq("ticker", ticker)
+        .order("analysis_date", desc=True)
+        .limit(1)
+        .execute()
+    )
+    return res.data[0] if res.data else None
+
+
 def render_analysis_tab(ticker: str, snap: dict) -> None:
     """
-    Full 🤖 AI Analysis tab. Call inside `with tab6:` in dashboard.py.
+    🤖 AI Analysis tab. Reads pre-generated analyses from Supabase ai_analyses.
 
-    Parameters
-    ----------
-    ticker : str   — currently selected ticker from sidebar
-    snap   : dict  — row from load_snapshot(ticker)
+    Analyses are produced in a Claude Code dev session and saved via
+    save_analysis.py — no Anthropic API key or credits required.
     """
-    st.subheader("🤖 AI-Powered Step-by-Step Analysis")
+    st.subheader("🤖 AI Step-by-Step Analysis")
     st.caption(
-        "Claude applies the Investment Valuation Framework v2 — "
-        "classifying the company, selecting the right valuation methods, "
-        "showing every calculation, running bear/base/bull scenarios, "
-        "and delivering a **Buy / Watch / Avoid** verdict."
+        "Claude applies the Investment Valuation Framework v2 to each ticker. "
+        "Analyses are generated in a dev session and stored in Supabase — "
+        "the dashboard reads them instantly, no API key needed."
     )
 
     if not snap:
         st.warning(
-            f"No fundamentals data found for **{ticker}**. "
-            "Run `python3 refresh_all.py` to populate the database first."
+            f"No fundamentals data for **{ticker}**. Run `python3 refresh_all.py`."
         )
         return
 
-    # ── Settings ───────────────────────────────────────────────────────────
-    with st.expander("⚙️  Analysis Settings", expanded=False):
-        col1, col2 = st.columns(2)
-        with col1:
-            discount_rate = st.slider(
-                "Required Return (Discount Rate)",
-                min_value=0.07, max_value=0.18,
-                value=0.12, step=0.01, format="%.0f%%",
-                help="Your minimum required annual return.",
-                key=f"dr_{ticker}",
-            )
-            sector_choice = st.selectbox(
-                "Sector Override",
-                ["Auto (from data)", "Technology", "Communication Services",
-                 "Healthcare", "Financials", "Energy", "Materials",
-                 "Consumer Staples", "Consumer Discretionary",
-                 "Industrials", "Utilities", "Real Estate"],
-                key=f"sector_{ticker}",
-            )
-        with col2:
-            profile_choice = st.selectbox(
-                "Financial Profile Override",
-                ["Auto (from data)", "Mature FCF Generator",
-                 "Growth + FCF Positive", "Pre-Profit / High Growth",
-                 "Dividend Payer", "Asset-Heavy / Regulated",
-                 "Cyclical Business", "Turnaround / Distressed", "REIT"],
-                key=f"profile_{ticker}",
-            )
-            analyst_notes = st.text_area(
-                "Analyst Notes (optional)",
-                placeholder="Recent earnings, one-time items, management guidance, macro factors...",
-                height=108,
-                key=f"notes_{ticker}",
-            )
+    analysis = _load_latest_analysis(ticker)
 
-    # ── Data preview ───────────────────────────────────────────────────────
-    with st.expander("📋  Data being sent to Claude", expanded=False):
-        preview_data = build_ticker_data(
-            snap, discount_rate=discount_rate,
-            sector_override=None if sector_choice == "Auto (from data)" else sector_choice,
-            profile_override=None if profile_choice == "Auto (from data)" else profile_choice,
+    if not analysis:
+        st.info(
+            f"No analysis stored for **{ticker}** yet.\n\n"
+            "**To generate one:** open a Claude Code session in this Codespace and ask:\n\n"
+            f"> *Generate the AI analysis for {ticker} and save it to Supabase*\n\n"
+            "Claude will read the snapshot, apply the framework, and save the result "
+            "to the `ai_analyses` table. The dashboard will then display it here."
         )
-        null_fields = [k for k, v in preview_data.items()
-                       if v is None and k != "analyst_notes"]
-        ok_fields   = [k for k, v in preview_data.items()
-                       if v is not None and k != "analyst_notes"]
-        c1, c2 = st.columns(2)
-        with c1:
-            st.success(f"✓ {len(ok_fields)} fields populated")
-        with c2:
-            if null_fields:
-                st.warning(f"⚠ {len(null_fields)} fields missing — Claude will use benchmarks")
-                st.caption(", ".join(null_fields[:12]) + ("..." if len(null_fields) > 12 else ""))
-            else:
-                st.success("✓ All fields populated")
+        return
 
-    # ── Run button ─────────────────────────────────────────────────────────
-    session_key = f"analysis_{ticker}"
-
-    if st.button(f"▶  Run Full Analysis for {ticker}",
-                 type="primary", use_container_width=True, key=f"run_{ticker}"):
-        ticker_data = build_ticker_data(
-            snap, discount_rate=discount_rate,
-            sector_override=None if sector_choice == "Auto (from data)" else sector_choice,
-            profile_override=None if profile_choice == "Auto (from data)" else profile_choice,
-            analyst_notes=analyst_notes or None,
+    # ── Verdict banner ────────────────────────────────────────────────────────
+    STYLES = {
+        "BUY":   {"bg": "#0a2e1a", "border": "#00d084", "emoji": "✅"},
+        "WATCH": {"bg": "#2e2200", "border": "#ffc107", "emoji": "⚠️"},
+        "AVOID": {"bg": "#2e0a0a", "border": "#ff4b4b", "emoji": "🚫"},
+    }
+    verdict = (analysis.get("verdict") or "").upper()
+    if verdict in STYLES:
+        s = STYLES[verdict]
+        st.markdown(
+            f'<div style="background:{s["bg"]};border:1px solid {s["border"]}55;'
+            f'border-left:5px solid {s["border"]};border-radius:8px;'
+            f'padding:18px 22px;margin:16px 0;font-size:20px;'
+            f'font-weight:700;color:{s["border"]};">'
+            f'{s["emoji"]} &nbsp; {verdict}</div>',
+            unsafe_allow_html=True,
         )
-        with st.spinner(f"Analyzing {ticker}... (15–30 seconds)"):
-            try:
-                st.session_state[session_key] = run_analysis(ticker_data)
-            except anthropic.AuthenticationError:
-                st.error("❌ Invalid API key. Check ANTHROPIC_API_KEY in your .env file.")
-                return
-            except Exception as e:
-                st.error(f"❌ Analysis failed: {e}")
-                return
 
-    # ── Display result ─────────────────────────────────────────────────────
-    if session_key in st.session_state:
-        text = st.session_state[session_key]
+    # ── Metadata strip ────────────────────────────────────────────────────────
+    meta_bits = [f"📅 {analysis['analysis_date']}"]
+    if analysis.get("sector"):
+        meta_bits.append(f"🏢 {analysis['sector']}")
+    if analysis.get("financial_profile"):
+        meta_bits.append(f"📊 {analysis['financial_profile']}")
+    if analysis.get("discount_rate"):
+        meta_bits.append(f"💰 Discount rate: {float(analysis['discount_rate'])*100:.0f}%")
+    st.caption("  ·  ".join(meta_bits))
 
-        # Verdict callout
-        STYLES = {
-            "BUY":   {"bg": "#0a2e1a", "border": "#00d084", "emoji": "✅"},
-            "WATCH": {"bg": "#2e2200", "border": "#ffc107", "emoji": "⚠️"},
-            "AVOID": {"bg": "#2e0a0a", "border": "#ff4b4b", "emoji": "🚫"},
-        }
-        verdict = next((v for v in ["BUY", "WATCH", "AVOID"] if f"VERDICT: {v}" in text), None)
-        if verdict:
-            s = STYLES[verdict]
-            st.markdown(
-                f'<div style="background:{s["bg"]};border:1px solid {s["border"]}55;'
-                f'border-left:5px solid {s["border"]};border-radius:8px;'
-                f'padding:18px 22px;margin:16px 0;font-size:20px;'
-                f'font-weight:700;color:{s["border"]};">'
-                f'{s["emoji"]} &nbsp; {verdict}</div>',
-                unsafe_allow_html=True,
-            )
+    # ── Full analysis text ────────────────────────────────────────────────────
+    st.markdown("---")
+    st.markdown(analysis["full_text"])
 
-        st.markdown("---")
-        st.markdown(f"```\n{text}\n```")
-        st.download_button(
-            label=f"⬇️  Download {ticker} Analysis (.txt)",
-            data=text, file_name=f"{ticker}_ai_analysis.txt",
-            mime="text/plain", key=f"dl_{ticker}",
-        )
+    # ── Download ──────────────────────────────────────────────────────────────
+    st.download_button(
+        label=f"⬇️  Download {ticker} Analysis (.md)",
+        data=analysis["full_text"],
+        file_name=f"{ticker}_analysis_{analysis['analysis_date']}.md",
+        mime="text/markdown",
+        key=f"dl_{ticker}",
+    )
