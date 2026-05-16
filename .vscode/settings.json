@@ -1,0 +1,5 @@
+{
+    "terminal.integrated.copyOnSelection": true,
+    "claudeTerminal.notification.showMessage": true,
+    "terminal.integrated.enableMultiLinePasteWarning": "always"
+}

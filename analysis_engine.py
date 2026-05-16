@@ -12,7 +12,22 @@ Usage in Streamlit:
 
 import anthropic
 import streamlit as st
+from dotenv import load_dotenv
 from prompts import SYSTEM_PROMPT, build_analysis_prompt
+
+load_dotenv()
+
+MODEL = "claude-opus-4-7"
+
+# System prompt cached with 1-hour TTL — it never changes between requests.
+# The 1h TTL pays off after 3+ analyses per hour at a 2x write / 0.1x read cost.
+_SYSTEM_CACHED = [
+    {
+        "type": "text",
+        "text": SYSTEM_PROMPT,
+        "cache_control": {"type": "ephemeral", "ttl": "1h"},
+    }
+]
 
 
 # ─────────────────────────────────────────────────────────────────────────────
@@ -48,9 +63,9 @@ def run_analysis(ticker_data: dict, stream: bool = True) -> str:
 def _run_blocking(client: anthropic.Anthropic, user_prompt: str) -> str:
     """Single API call — waits for full response before returning."""
     message = client.messages.create(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
+        model=MODEL,
+        max_tokens=8192,
+        system=_SYSTEM_CACHED,
         messages=[{"role": "user", "content": user_prompt}],
     )
     return message.content[0].text
@@ -68,15 +83,14 @@ def _run_streaming(client: anthropic.Anthropic, user_prompt: str) -> str:
     placeholder = st.empty()
 
     with client.messages.stream(
-        model="claude-sonnet-4-20250514",
-        max_tokens=4096,
-        system=SYSTEM_PROMPT,
+        model=MODEL,
+        max_tokens=8192,
+        system=_SYSTEM_CACHED,
         messages=[{"role": "user", "content": user_prompt}],
     ) as stream:
         for text_chunk in stream.text_stream:
             full_text += text_chunk
-            # Update the placeholder with everything received so far
-            placeholder.text(full_text)
+            placeholder.markdown(full_text)
 
     return full_text
 
