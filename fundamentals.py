@@ -305,17 +305,42 @@ class FundamentalsExtractor:
         return rows
 
     def get_snapshot(self) -> dict:
-        """Build a TTM-based fundamentals snapshot for today."""
+        """
+        Build a TTM-based fundamentals snapshot for today.
+
+        Extended to include all fields required by the Investment Valuation
+        Framework v2 AI analysis engine (analysis_engine.py / prompts.py).
+        New fields are clearly marked with # NEW below.
+        """
 
         # ── Market data ───────────────────────────────────────────────────────
         price        = self._fast_info_val("last_price", "regularMarketPrice")
         market_cap   = self._fast_info_val("market_cap", "marketCap")
         shares       = _to_int(self._fast_info_val("shares", "sharesOutstanding"))
 
+        # ── yfinance .info for fields not in financial statements ─────────────
+        # NEW: dividend yield, dividend per share, sector — from yf.info
+        info = {}
+        try:
+            info = self._yf.info or {}
+        except Exception:
+            info = {}
+
+        dividend_yield     = _to_float(info.get("dividendYield"))           # NEW
+        dividend_per_share = _to_float(info.get("dividendRate"))            # NEW
+        sector             = info.get("sector") or info.get("sectorDisp")   # NEW
+        currency           = info.get("currency", "USD")                    # NEW
+        exchange           = info.get("exchange") or info.get("exchangeName") # NEW
+        company_name       = info.get("shortName") or info.get("longName")  # NEW
+        beta               = _to_float(info.get("beta"))                    # NEW
+
         # ── TTM helpers ───────────────────────────────────────────────────────
         income_rows  = self.get_income_rows("quarterly")
         cf_rows      = self.get_cashflow_rows("quarterly")
         balance_rows = self.get_balance_rows("quarterly")
+
+        # Annual income for revenue CAGR — need prior years
+        annual_income = self.get_income_rows("annual")  # NEW
 
         def ttm_sum(rows: list[dict], key: str, n: int = 4) -> Optional[float]:
             vals = [r[key] for r in rows[:n] if r.get(key) is not None]
@@ -328,17 +353,27 @@ class FundamentalsExtractor:
             return None
 
         revenue_ttm    = ttm_sum(income_rows,  "revenue")
+        gross_profit_ttm = ttm_sum(income_rows, "gross_profit")             # NEW
         ebitda_ttm     = ttm_sum(income_rows,  "ebitda")
         net_income_ttm = ttm_sum(income_rows,  "net_income")
         op_income_ttm  = ttm_sum(income_rows,  "operating_income")
+        interest_exp_ttm = ttm_sum(income_rows, "interest_expense")         # NEW
         cfo_ttm        = ttm_sum(cf_rows,      "operating_cash_flow")
         fcf_ttm        = ttm_sum(cf_rows,      "free_cash_flow")
+        dividends_ttm  = ttm_sum(cf_rows,      "dividends_paid")            # NEW
+        buybacks_ttm   = ttm_sum(cf_rows,      "share_buybacks")            # NEW
 
         cash_latest    = latest(balance_rows, "cash_and_equivalents")
         debt_latest    = latest(balance_rows, "total_debt")
         equity_latest  = latest(balance_rows, "total_equity")
         assets_latest  = latest(balance_rows, "total_assets")
         tax_rate       = latest(income_rows,  "tax_rate")
+
+        # ── Net debt ──────────────────────────────────────────────────────────
+        # NEW: net_debt in snapshot for the AI engine
+        net_debt = None
+        if debt_latest is not None or cash_latest is not None:
+            net_debt = (debt_latest or 0) - (cash_latest or 0)
 
         # ── Enterprise value ──────────────────────────────────────────────────
         ev = None
@@ -354,19 +389,36 @@ class FundamentalsExtractor:
         price_fcf = _safe_div(market_cap, fcf_ttm)
         fcf_yield = _safe_div(fcf_ttm, market_cap)
 
-        # PEG = PE / (revenue_growth_yoy * 100)  — growth expressed as %
+        # PEG = PE / (revenue_growth_yoy * 100)
         rev_growth = latest(income_rows, "revenue_growth_yoy")
         peg = None
         if pe is not None and rev_growth is not None and rev_growth > 0:
             peg = pe / (rev_growth * 100)
+
+        # ── Revenue CAGR (3yr) — from annual income ───────────────────────────
+        # NEW: use annual rows to compute 3yr revenue CAGR for the AI prompt
+        rev_cagr_3yr = None
+        if len(annual_income) >= 4:
+            # annual_income[0] = most recent, [3] = 3 years ago
+            rev_now = annual_income[0].get("revenue")
+            rev_3yr = annual_income[3].get("revenue")
+            if rev_now and rev_3yr and rev_3yr > 0:
+                rev_cagr_3yr = (rev_now / rev_3yr) ** (1 / 3) - 1
+
+        # Revenue prior years for AI prompt (from annual)                   # NEW
+        revenue_prior_yr = annual_income[1].get("revenue") if len(annual_income) > 1 else None
+        revenue_2yr_ago  = annual_income[2].get("revenue") if len(annual_income) > 2 else None
+
+        # ── Margin metrics ────────────────────────────────────────────────────
+        gross_margin   = _safe_div(gross_profit_ttm, revenue_ttm)           # NEW
+        operating_margin = _safe_div(op_income_ttm, revenue_ttm)            # NEW
+        fcf_margin     = _safe_div(fcf_ttm, revenue_ttm)                    # NEW
 
         # ── Quality metrics ───────────────────────────────────────────────────
         roe = _safe_div(net_income_ttm, equity_latest)
         roa = _safe_div(net_income_ttm, assets_latest)
 
         # ROIC = NOPAT / Invested Capital
-        # NOPAT = operating_income_ttm * (1 - tax_rate)
-        # Invested Capital = equity + debt - cash
         roic = None
         if op_income_ttm is not None and tax_rate is not None:
             invested_cap = None
@@ -378,28 +430,91 @@ class FundamentalsExtractor:
 
         fcf_conversion = _safe_div(fcf_ttm, net_income_ttm)
 
+        # ── Dividend coverage ratio ───────────────────────────────────────────
+        # NEW: FCF / dividends paid — key metric for dividend sustainability
+        div_coverage = _safe_div(fcf_ttm, abs(dividends_ttm)) if dividends_ttm else None
+
+        # ── Debt / EBITDA ─────────────────────────────────────────────────────
+        # NEW: primary leverage metric for the AI framework
+        debt_ebitda = _safe_div(debt_latest, ebitda_ttm)
+
+        # ── Rule of 40 (for tech companies) ──────────────────────────────────
+        # NEW: revenue_growth_yoy * 100 + fcf_margin * 100
+        rule_of_40 = None
+        if rev_growth is not None and fcf_margin is not None:
+            rule_of_40 = (rev_growth * 100) + (fcf_margin * 100)
+
         return {
-            "ticker":            self.ticker,
-            "snapshot_date":     date.today().isoformat(),
-            "price":             price,
-            "market_cap":        market_cap,
-            "enterprise_value":  ev,
-            "shares_outstanding": shares,
-            "revenue_ttm":       revenue_ttm,
-            "ebitda_ttm":        ebitda_ttm,
-            "net_income_ttm":    net_income_ttm,
-            "cfo_ttm":           cfo_ttm,
-            "fcf_ttm":           fcf_ttm,
-            "pe_ratio":          pe,
-            "ps_ratio":          ps,
-            "pb_ratio":          pb,
-            "ev_ebitda":         ev_ebitda,
-            "ev_revenue":        ev_rev,
-            "peg_ratio":         peg,
-            "fcf_yield":         fcf_yield,
-            "price_fcf":         price_fcf,
-            "roe":               roe,
-            "roa":               roa,
-            "roic":              roic,
-            "fcf_conversion":    fcf_conversion,
+            # ── Identity ──────────────────────────────────────────────────────
+            "ticker":              self.ticker,
+            "snapshot_date":       date.today().isoformat(),
+            "company_name":        company_name,        # NEW
+            "sector":              sector,              # NEW
+            "currency":            currency,            # NEW
+            "exchange":            exchange,            # NEW
+
+            # ── Market data ───────────────────────────────────────────────────
+            "price":               price,
+            "market_cap":          market_cap,
+            "enterprise_value":    ev,
+            "shares_outstanding":  shares,
+            "beta":                beta,                # NEW
+
+            # ── Income statement (TTM) ────────────────────────────────────────
+            "revenue_ttm":         revenue_ttm,
+            "revenue_prior_yr":    revenue_prior_yr,   # NEW
+            "revenue_2yr_ago":     revenue_2yr_ago,    # NEW
+            "gross_profit_ttm":    gross_profit_ttm,   # NEW
+            "ebitda_ttm":          ebitda_ttm,
+            "net_income_ttm":      net_income_ttm,
+            "operating_income_ttm": op_income_ttm,     # NEW
+            "interest_expense_ttm": interest_exp_ttm,  # NEW
+
+            # ── Cash flow (TTM) ───────────────────────────────────────────────
+            "cfo_ttm":             cfo_ttm,
+            "fcf_ttm":             fcf_ttm,
+            "dividends_paid_ttm":  dividends_ttm,      # NEW
+            "buybacks_ttm":        buybacks_ttm,       # NEW
+
+            # ── Balance sheet (latest quarter) ────────────────────────────────
+            "cash":                cash_latest,        # NEW
+            "total_debt":          debt_latest,        # NEW
+            "net_debt":            net_debt,           # NEW
+            "total_equity":        equity_latest,      # NEW
+            "total_assets":        assets_latest,      # NEW
+            "tax_rate":            tax_rate,           # NEW
+
+            # ── Valuation multiples ───────────────────────────────────────────
+            "pe_ratio":            pe,
+            "ps_ratio":            ps,
+            "pb_ratio":            pb,
+            "ev_ebitda":           ev_ebitda,
+            "ev_revenue":          ev_rev,
+            "peg_ratio":           peg,
+            "fcf_yield":           fcf_yield,
+            "price_fcf":           price_fcf,
+            "dividend_yield":      dividend_yield,     # NEW
+            "dividend_per_share":  dividend_per_share, # NEW
+
+            # ── Margin metrics ────────────────────────────────────────────────
+            "gross_margin":        gross_margin,       # NEW
+            "operating_margin":    operating_margin,   # NEW
+            "fcf_margin":          fcf_margin,         # NEW
+
+            # ── Quality metrics ───────────────────────────────────────────────
+            "roe":                 roe,
+            "roa":                 roa,
+            "roic":                roic,
+            "fcf_conversion":      fcf_conversion,
+
+            # ── Leverage & coverage ───────────────────────────────────────────
+            "debt_ebitda":         debt_ebitda,        # NEW
+            "dividend_coverage":   div_coverage,       # NEW
+
+            # ── Growth ────────────────────────────────────────────────────────
+            "revenue_growth_yoy":  rev_growth,         # already existed in income rows, now in snapshot
+            "revenue_cagr_3yr":    rev_cagr_3yr,       # NEW
+
+            # ── Composite metrics ─────────────────────────────────────────────
+            "rule_of_40":          rule_of_40,         # NEW
         }

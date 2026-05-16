@@ -8,6 +8,7 @@ from dotenv import load_dotenv
 from plotly.subplots import make_subplots
 from supabase import create_client
 
+from analysis_engine import render_analysis_tab
 from indicators import add_bollinger_bands, add_moving_averages, add_rsi
 from valuation import (
     METHOD_INFO, GRAHAM_INFO, SIGNAL_CONFIG,
@@ -341,9 +342,9 @@ df = add_bollinger_bands(df)
 df = add_rsi(df)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
     "📊  Chart", "⚖️  Compare", "🏦  Fundamentals",
-    "📐  Valuation", "💼  Portfolio",
+    "📐  Valuation", "💼  Portfolio", "🤖  AI Analysis",
 ])
 
 
@@ -1140,3 +1141,11 @@ with tab5:
         stat_card("Portfolio Signal",
                   f'{cfg_p["icon"]} {dominant}',
                   f"({signal_counts.get(dominant,0)} of {len(df_port)} positions)")
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 6 — AI ANALYSIS
+# ════════════════════════════════════════════════════════════════════════════════
+with tab6:
+    snap = load_snapshot(ticker)
+    render_analysis_tab(ticker, snap)
