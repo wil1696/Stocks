@@ -1,10 +1,16 @@
 """
 refresh_all.py
-Orchestrates the daily data refresh: fetch_stocks → save_fundamentals.
+Orchestrates the daily data refresh, in dependency order:
+    1. fetch_stocks      (prices)
+    2. save_fundamentals (snapshot)
+    3. sector_stats      (per-sector descriptive statistics)
+    4. company_ranks     (per-company percentile ranks within sector)
 
 Universe-selection flags (--tickers / --limit / --sector / --no-resume) are
-forwarded to both steps so a single command can drive an end-to-end refresh
-over any subset of the universe.
+forwarded to steps 1-2 so a single command can drive an end-to-end refresh over
+any subset of the universe. Steps 3-4 deliberately IGNORE those flags and always
+run over the full universe: a sector statistic or percentile rank computed over a
+partial subset would be meaningless.
 
 Usage:
     python3 refresh_all.py                                # full universe
@@ -23,6 +29,8 @@ from datetime import datetime, timezone
 
 import fetch_stocks
 import save_fundamentals
+import sector_stats
+import company_ranks
 from universe import add_universe_args
 
 
@@ -46,12 +54,20 @@ def run(argv: list[str] | None = None) -> bool:
     prices_ok       = _run_step("fetch_stocks",      fetch_stocks.main,      step_argv)
     fundamentals_ok = _run_step("save_fundamentals", save_fundamentals.main, step_argv)
 
+    # Steps 3-4 always run over the full universe (no step_argv): partial-subset
+    # statistics/ranks are meaningless. Both depend on fresh snapshots from step 2.
+    stats_ok = _run_step("sector_stats",  sector_stats.main,  [])
+    ranks_ok = _run_step("company_ranks", company_ranks.main, [])
+
     elapsed = (datetime.now(timezone.utc) - started).total_seconds()
-    status  = "SUCCESS" if (prices_ok and fundamentals_ok) else "PARTIAL FAILURE"
+    all_ok  = prices_ok and fundamentals_ok and stats_ok and ranks_ok
+    status  = "SUCCESS" if all_ok else "PARTIAL FAILURE"
     print(f"\n[refresh_all] Done in {elapsed:.1f}s — {status}")
     print(f"  fetch_stocks:      {'OK' if prices_ok else 'FAILED'}")
     print(f"  save_fundamentals: {'OK' if fundamentals_ok else 'FAILED'}")
-    return prices_ok and fundamentals_ok
+    print(f"  sector_stats:      {'OK' if stats_ok else 'FAILED'}")
+    print(f"  company_ranks:     {'OK' if ranks_ok else 'FAILED'}")
+    return all_ok
 
 
 def _rebuild_argv(args: argparse.Namespace) -> list[str]:

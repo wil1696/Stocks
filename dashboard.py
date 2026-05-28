@@ -263,6 +263,73 @@ def load_beta(ticker: str) -> "float | None":
     return float(v) if v is not None else None
 
 
+def _num(v):
+    """Coerce a possibly-string/None Supabase numeric to float (or None)."""
+    try:
+        return float(v) if v is not None else None
+    except (TypeError, ValueError):
+        return None
+
+
+@st.cache_data(ttl=3600)
+def load_company_ranks(ticker: str) -> dict:
+    """Latest per-metric percentile ranks for one ticker.
+
+    Returns {"sector": <GICS sector or None>,
+             "ranks": {metric_name: {"raw_value": .., "percentile_rank": ..}}}.
+    Selects the most recent calculated_at batch (history is preserved in the table).
+    """
+    res = (
+        get_client().table("company_ranks")
+        .select("metric_name, raw_value, percentile_rank, sector, calculated_at")
+        .eq("ticker", ticker)
+        .order("calculated_at", desc=True)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return {"sector": None, "ranks": {}}
+    latest = rows[0]["calculated_at"]
+    sector, ranks = None, {}
+    for r in rows:
+        if r["calculated_at"] != latest:
+            continue
+        sector = r.get("sector")
+        ranks[r["metric_name"]] = {
+            "raw_value":       _num(r.get("raw_value")),
+            "percentile_rank": _num(r.get("percentile_rank")),
+        }
+    return {"sector": sector, "ranks": ranks}
+
+
+@st.cache_data(ttl=3600)
+def load_sector_stats(sector: str) -> dict:
+    """Latest descriptive statistics for a GICS sector, keyed by metric_name."""
+    if not sector:
+        return {}
+    res = (
+        get_client().table("sector_statistics")
+        .select("*")
+        .eq("sector", sector)
+        .order("calculated_at", desc=True)
+        .execute()
+    )
+    rows = res.data or []
+    if not rows:
+        return {}
+    latest = rows[0]["calculated_at"]
+    out = {}
+    for r in rows:
+        if r["calculated_at"] != latest:
+            continue
+        out[r["metric_name"]] = {
+            k: _num(v) if k != "sample_size" else (int(v) if v is not None else None)
+            for k, v in r.items()
+            if k not in ("sector", "metric_name", "calculated_at")
+        }
+    return out
+
+
 # ── Helpers ───────────────────────────────────────────────────────────────────
 def stat_card(label: str, value: str, sub: str = "", sub_class: str = "") -> None:
     sub_html = f'<div class="stat-sub {sub_class}">{sub}</div>' if sub else ""
@@ -580,6 +647,110 @@ with tab3:
     with q2: stat_card("ROA",            fmt_pct(snap.get("roa")))
     with q3: stat_card("ROIC",           fmt_pct(snap.get("roic")))
     with q4: stat_card("FCF Conversion", fmt_multiple(snap.get("fcf_conversion")))
+
+    st.markdown("<br>", unsafe_allow_html=True)
+
+    # ── Sector Benchmarks ─────────────────────────────────────────────────────
+    st.subheader("Sector Benchmarks")
+    cr          = load_company_ranks(ticker)
+    gics_sector = cr.get("sector")
+    sstats      = load_sector_stats(gics_sector) if gics_sector else {}
+
+    if not cr.get("ranks") or not sstats:
+        st.info(
+            "No sector benchmark data yet. Apply migrations **008**/**009**, then run "
+            "`python3 sector_stats.py` and `python3 company_ranks.py` "
+            "(or the full `python3 refresh_all.py`)."
+        )
+    else:
+        # (metric_key, label, format, inverted = lower-is-better)
+        BENCHMARK_METRICS = [
+            ("roic",             "ROIC",             "pct",    False),
+            ("roe",              "ROE",              "pct",    False),
+            ("gross_margin",     "Gross Margin",     "pct",    False),
+            ("operating_margin", "Operating Margin", "pct",    False),
+            ("fcf_margin",       "FCF Margin",       "pct",    False),
+            ("rule_of_40",       "Rule of 40",       "pts",    False),
+            ("fcf_yield",        "FCF Yield",        "pct",    False),
+            ("pe_ratio",         "P/E",              "mult",   True),
+            ("ev_ebitda",        "EV / EBITDA",      "mult",   True),
+            ("ev_revenue",       "EV / Revenue",     "mult",   True),
+            ("pb_ratio",         "P/B",              "mult",   True),
+            ("debt_ebitda",      "Debt / EBITDA",    "mult",   True),
+            ("dividend_yield",   "Dividend Yield",   "pctraw", False),
+        ]
+
+        def _fmt_metric(val, fmt):
+            if val is None:
+                return "—"
+            if fmt == "pct":    return f"{val * 100:.1f}%"   # stored as decimal
+            if fmt == "pctraw": return f"{val:.2f}%"          # stored already in %
+            if fmt == "mult":   return f"{val:.1f}x"
+            if fmt == "pts":    return f"{val:.0f}"
+            return f"{val:.2f}"
+
+        def _rank_color(r):
+            if r is None: return "#8b8fa8"
+            if r >= 67:   return GREEN
+            if r >= 33:   return "#f0b429"
+            return RED
+
+        st.caption(
+            f"How **{ticker}** ranks against its **{gics_sector}** peers (GICS sector). "
+            "Percentile rank is 0–100 where **100 = best in sector**. Rows marked "
+            "↓ are *lower-is-better* (cheaper / less levered); their cut-off columns are "
+            "ordered so values improve left→right, consistent with every other row."
+        )
+
+        header = (
+            '<tr style="color:#8b8fa8; font-size:11px; text-transform:uppercase; '
+            'letter-spacing:0.5px; border-bottom:1px solid #2a2d36;">'
+            '<th style="text-align:left;  padding:8px 10px;">Metric</th>'
+            '<th style="text-align:right; padding:8px 10px;">This Co.</th>'
+            '<th style="text-align:right; padding:8px 10px;">P25</th>'
+            '<th style="text-align:right; padding:8px 10px;">Median</th>'
+            '<th style="text-align:right; padding:8px 10px;">P75</th>'
+            '<th style="text-align:right; padding:8px 10px;">P90</th>'
+            '<th style="text-align:right; padding:8px 10px;">%ile Rank</th></tr>'
+        )
+
+        body = ""
+        for key, label, fmt, inverted in BENCHMARK_METRICS:
+            rank_info = cr["ranks"].get(key)
+            stat      = sstats.get(key)
+            if not rank_info or not stat:
+                continue   # company has no usable value, or sector has no stat row
+
+            this_co = _fmt_metric(rank_info.get("raw_value"), fmt)
+            rank    = rank_info.get("percentile_rank")
+
+            # Inverted metrics: flip the cut-offs so the columns read "better →".
+            if inverted:
+                cutoffs = [stat.get("p75"), stat.get("p50"), stat.get("p25"), stat.get("p10")]
+            else:
+                cutoffs = [stat.get("p25"), stat.get("p50"), stat.get("p75"), stat.get("p90")]
+            cut_html = "".join(
+                f'<td style="text-align:right; padding:7px 10px; color:#cfd2dc;">'
+                f'{_fmt_metric(c, fmt)}</td>' for c in cutoffs
+            )
+
+            lbl = label + (' <span style="color:#6b6f82;">↓</span>' if inverted else "")
+            rc  = _rank_color(rank)
+            rank_disp = f"{rank:.0f}" if rank is not None else "—"
+            body += (
+                '<tr style="border-bottom:1px solid #20232b;">'
+                f'<td style="text-align:left;  padding:7px 10px; color:#fff;">{lbl}</td>'
+                f'<td style="text-align:right; padding:7px 10px; color:#fff; font-weight:600;">{this_co}</td>'
+                f'{cut_html}'
+                f'<td style="text-align:right; padding:7px 10px; font-weight:700; color:{rc};">{rank_disp}</td>'
+                '</tr>'
+            )
+
+        st.markdown(
+            f'<table style="width:100%; border-collapse:collapse; font-size:13px;">'
+            f'{header}{body}</table>',
+            unsafe_allow_html=True,
+        )
 
     st.markdown("<br>", unsafe_allow_html=True)
 

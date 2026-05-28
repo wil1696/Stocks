@@ -47,6 +47,12 @@ python3 refresh_all.py --limit 10               # smoke test
 python3 refresh_all.py --tickers AAPL,MSFT      # explicit subset
 python3 refresh_all.py --sector "Information Technology"
 
+# Recompute sector statistics + percentile ranks standalone (also run by refresh_all,
+# steps 3–4). These always operate on the full universe, ignoring --tickers/--limit.
+python3 sector_stats.py --dry-run     # preview, no writes
+python3 sector_stats.py               # write sector_statistics
+python3 company_ranks.py              # write company_ranks (run after sector_stats)
+
 # Verify Supabase connection
 python3 verify_connection.py
 ```
@@ -85,9 +91,11 @@ Required env vars:
 ### Data pipeline
 | File | Purpose |
 |---|---|
-| `refresh_all.py` | Orchestrates full refresh: fetch_stocks → save_fundamentals. Forwards CLI flags to both steps. |
+| `refresh_all.py` | Orchestrates the daily refresh in order: fetch_stocks → save_fundamentals → sector_stats → company_ranks. Forwards universe flags to steps 1–2 only; stats/ranks always run over the full universe. |
 | `fetch_stocks.py` | Pulls 5yr daily OHLCV from yfinance → Supabase `stock_prices`. Universe-driven, resilient (retry+backoff), resumable. |
 | `save_fundamentals.py` | Pulls income, balance, cash flow, snapshot from yfinance → Supabase. Same resilience profile as `fetch_stocks.py`. |
+| `sector_stats.py` | Computes descriptive stats per (GICS sector × metric) over the latest snapshots → Supabase `sector_statistics`. numpy only; `--dry-run` / `--sector`. See "Stage 2a" below. |
+| `company_ranks.py` | Empirical percentile rank of each company vs its GICS-sector peers (0–100, 100 = best) → Supabase `company_ranks`. Reuses `sector_stats` loaders. |
 | `fundamentals.py` | `FundamentalsExtractor` — fetches and transforms fundamentals for one ticker. |
 | `universe.py` | Shared helper: `load_active_tickers()`, `add_universe_args()`, `resolve_tickers()`. The single entry point both pipelines use to decide which tickers to process. |
 | `seed_universe.py` | Pulls current S&P 500 from Wikipedia and upserts into `companies`. Soft-deletes dropped tickers (`is_active=FALSE`). Idempotent; run weekly. |
@@ -123,6 +131,8 @@ Tables created by `migrations/`:
 | `fundamentals_snapshot` | TTM snapshot with valuation multiples + quality metrics. One row per ticker per snapshot date. | ~500 / day |
 | `portfolio_holdings` | Personal portfolio positions | 0 (user fills in) |
 | `ai_analyses` | Pre-generated AI analyses (markdown); written by `save_analysis.py`, read by the dashboard. | grows on demand |
+| `sector_statistics` | Descriptive stats per (GICS sector, metric, calculated_at) — min/max/mean/median/std/mad/p10–p90 + sample_size. History-preserving (one batch per run). | ~209 / run |
+| `company_ranks` | Per-company percentile rank (0–100, 100 = best) per metric within GICS sector + raw_value. History-preserving. | ~9,000 / run |
 
 Migrations (run in order against Supabase):
 - `migrations/001_create_stock_tables.sql` — `companies` + `stock_prices`
@@ -132,6 +142,8 @@ Migrations (run in order against Supabase):
 - `migrations/005_create_ai_analyses.sql` — `ai_analyses`
 - `migrations/006_ai_analyses_rls.sql` — anon SELECT policy for `ai_analyses`
 - `migrations/007_extend_companies_universe.sql` — extends `companies` with sector/sub_industry/date_added/is_active for the S&P 500 universe
+- `migrations/008_create_sector_statistics.sql` — `sector_statistics` (Stage 2a)
+- `migrations/009_create_company_ranks.sql` — `company_ranks` (Stage 2a)
 
 `companies.exchange` exists from migration 001 but is intentionally left NULL
 for seeded rows — nothing downstream reads it. Backfill only if expanding
@@ -143,7 +155,7 @@ beyond US markets.
 
 1. **📊 Chart** — Candlestick + volume + RSI, with MA20/MA50/MA200 and Bollinger Band overlays
 2. **⚖️ Compare** — Normalised % return comparison across selected tickers
-3. **🏦 Fundamentals** — Valuation multiples, quality metrics (ROE/ROA/ROIC), revenue/margin/cash flow charts
+3. **🏦 Fundamentals** — Valuation multiples, quality metrics (ROE/ROA/ROIC), revenue/margin/cash flow charts, **Sector Benchmarks** table (this co. vs GICS-peer percentile cut-offs + percentile rank; see Stage 2a)
 4. **📐 Valuation** — DCF with sliders, P/E + EV/EBITDA + P/S multiples, Reverse DCF, Graham Number, overall BUY/WATCH/AVOID signal
 5. **💼 Portfolio** — Add/edit/delete holdings, P&L per position, portfolio signal summary
 6. **🤖 AI Analysis** *(to be wired in)* — Full Claude-powered step-by-step analysis using `render_analysis_tab()` from `analysis_engine.py`
@@ -189,6 +201,64 @@ Located in `docs/framework/investment_framework_v2.docx`.
 - Identify a catalyst before buying
 
 Sector deep-dives: `docs/deepdives/` (tech, comms, consumer discretionary).
+
+---
+
+## Stage 2a — sector statistics & percentile ranking
+
+A cross-sector benchmarking layer built on top of `fundamentals_snapshot`. Goal:
+rank each company against its **own GICS-sector peers** using evidence-based
+percentile cut-offs instead of textbook thresholds — the foundation for any
+later scoring.
+
+**Pipeline (steps 3–4 of `refresh_all.py`):**
+```
+save_fundamentals → sector_stats.py → company_ranks.py
+```
+Both always run over the **full universe** (a stat/rank over a `--limit` subset
+is meaningless, so universe flags are not forwarded to them). `company_ranks`
+imports its loaders from `sector_stats`, so both rank the identical cleaned
+universe.
+
+**The 19 metrics profiled:** 17 read directly from `fundamentals_snapshot`
+(`roic, roe, roa, fcf_margin, operating_margin, gross_margin, revenue_cagr_3yr,
+debt_ebitda, fcf_conversion, rule_of_40, fcf_yield, pe_ratio, ev_ebitda,
+ev_revenue, pb_ratio, dividend_yield, dividend_coverage`) + 2 derived on the fly
+(`earnings_yield = 1/pe_ratio` for pe>0; `p_ocf = market_cap/cfo_ttm` for cfo>0).
+
+**Key design decisions:**
+- **Group on `companies.sector` (GICS naming)** — never `fundamentals_snapshot.sector`
+  (yfinance naming); the two use different vocabularies. See gotchas below.
+- **Inverted ("lower is better") metrics** = `{pe_ratio, ev_ebitda, ev_revenue,
+  pb_ratio, debt_ebitda, p_ocf}`. For these, non-positive values are dropped
+  (a negative P/E is lossmaking, not cheap) and the percentile rank is flipped
+  so cheap/low-leverage names score high. `percentile_rank` is therefore always
+  "100 = best", regardless of metric direction.
+- **Percentile rank is empirical** (midrank vs the full sector peer set), not
+  interpolated from the 5 stored cut-offs.
+- **numpy only** (no scipy — it's not a project dependency). MAD = median(|x − median|).
+- **History-preserving:** every run stamps one `calculated_at`; read "latest"
+  via `MAX(calculated_at)`. PK includes `calculated_at`.
+- **RLS + anon SELECT policy** on both tables (in migrations 008/009), mirroring
+  `ai_analyses` — required so the dashboard's anon key can read them (new tables
+  are not exposed to `anon` by default).
+
+**Dashboard:** the Fundamentals tab's **Sector Benchmarks** table reads
+`company_ranks` (rank) + `sector_statistics` (cut-offs). Inverted rows are marked
+↓ and their cut-off columns are flipped so values read "better →" consistently.
+
+### Data gotchas (bit us building this; easy to repeat)
+- **`companies.sector` (GICS) ≠ `fundamentals_snapshot.sector` (yfinance).**
+  e.g. GICS "Information Technology" / "Financials" / "Health Care" vs yfinance
+  "Technology" / "Financial Services" / "Healthcare". Always group/filter on the
+  GICS column (it's also 0-null; the snapshot one is occasionally NULL).
+- **`dividend_yield` is stored in PERCENT units** (e.g. 3.06 = 3.06%), unlike
+  `fcf_yield` and the margin/return ratios which are decimals (0.03 = 3%). Format
+  accordingly (the dashboard uses a per-metric format flag).
+- **Financials FCF/EBITDA metrics are structurally meaningless** — banks have no
+  EBITDA/gross profit and odd FCF (e.g. JPM `fcf_margin` ≈ −0.58 → rank ~2; no
+  roic/gross_margin/ev_ebitda rows). Those near-worst ranks are correct-but-
+  irrelevant; rank financials on P/B & ROE per the framework.
 
 ---
 
