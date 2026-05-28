@@ -43,7 +43,7 @@ def fetch_sp500() -> pd.DataFrame:
         "Founded":              "founded",
     })
     df["ticker"] = df["ticker"].str.replace(".", "-", regex=False)
-    return df[["ticker", "name", "sector", "sub_industry", "headquarters"]]
+    return df[["ticker", "name", "sector", "sub_industry", "headquarters", "date_added"]]
 
 
 def _get_market_cap(ticker: str) -> tuple[str, float | None]:
