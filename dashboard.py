@@ -1,6 +1,7 @@
 import os
 from datetime import datetime, timedelta
 
+import numpy as np
 import pandas as pd
 import plotly.graph_objects as go
 import streamlit as st
@@ -409,9 +410,10 @@ df = add_bollinger_bands(df)
 df = add_rsi(df)
 
 # ── Tabs ──────────────────────────────────────────────────────────────────────
-tab1, tab2, tab3, tab4, tab5, tab6 = st.tabs([
+tab1, tab2, tab3, tab4, tab5, tab6, tab7, tab8 = st.tabs([
     "📊  Chart", "⚖️  Compare", "🏦  Fundamentals",
     "📐  Valuation", "💼  Portfolio", "🤖  AI Analysis",
+    "🔭  Universe Explorer", "🎯  Rules Filter",
 ])
 
 
@@ -676,6 +678,7 @@ with tab3:
             ("ev_ebitda",        "EV / EBITDA",      "mult",   True),
             ("ev_revenue",       "EV / Revenue",     "mult",   True),
             ("pb_ratio",         "P/B",              "mult",   True),
+            ("p_ocf",            "P/OCF",            "mult",   True),
             ("debt_ebitda",      "Debt / EBITDA",    "mult",   True),
             ("dividend_yield",   "Dividend Yield",   "pctraw", False),
         ]
@@ -1319,3 +1322,807 @@ with tab5:
 with tab6:
     snap = load_snapshot(ticker)
     render_analysis_tab(ticker, snap)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 7 — UNIVERSE EXPLORER
+# ════════════════════════════════════════════════════════════════════════════════
+# Universe-wide exploratory analysis across sectors (independent of the sidebar
+# ticker). Reads the latest fundamentals_snapshot cross-section joined to
+# companies (GICS sector + clean company_name), once, cached.
+
+# (key, label, format, inverted = lower-is-better) — the 19 explorable metrics
+METRIC_DEFS = [
+    ("roic",             "ROIC",              "pct",    False),
+    ("roe",              "ROE",               "pct",    False),
+    ("roa",              "ROA",               "pct",    False),
+    ("fcf_margin",       "FCF Margin",        "pct",    False),
+    ("operating_margin", "Operating Margin",  "pct",    False),
+    ("gross_margin",     "Gross Margin",      "pct",    False),
+    ("revenue_cagr_3yr", "Revenue CAGR 3Y",   "pct",    False),
+    ("debt_ebitda",      "Debt / EBITDA",     "mult",   True),
+    ("fcf_conversion",   "FCF Conversion",    "mult",   False),
+    ("rule_of_40",       "Rule of 40",        "pts",    False),
+    ("fcf_yield",        "FCF Yield",         "pct",    False),
+    ("pe_ratio",         "P/E",               "mult",   True),
+    ("ev_ebitda",        "EV / EBITDA",       "mult",   True),
+    ("ev_revenue",       "EV / Revenue",      "mult",   True),
+    ("pb_ratio",         "P/B",               "mult",   True),
+    ("dividend_yield",   "Dividend Yield",    "pctraw", False),
+    ("dividend_coverage","Dividend Coverage", "mult",   False),
+    ("earnings_yield",   "Earnings Yield",    "pct",    False),
+    ("p_ocf",            "P/OCF",             "mult",   True),
+]
+METRIC_LABEL = {k: lbl for k, lbl, _, _ in METRIC_DEFS}
+METRIC_FMT   = {k: f   for k, _, f, _ in METRIC_DEFS}
+METRIC_KEYS  = [k for k, *_ in METRIC_DEFS]
+DERIVED_KEYS = {"earnings_yield", "p_ocf"}
+DIRECT_METRIC_KEYS = [k for k in METRIC_KEYS if k not in DERIVED_KEYS]
+
+# Clean, dark-theme-friendly sector palette (assigned to sorted sectors)
+SECTOR_PALETTE = [
+    "#00d4ff", "#00d084", "#f0b429", "#b794f4", "#ff4b4b", "#ff9f40",
+    "#4dd0e1", "#e57373", "#9ccc65", "#ba68c8", "#7986cb",
+]
+
+
+def _sector_colors(sectors) -> dict:
+    s = sorted(sectors)
+    return {sec: SECTOR_PALETTE[i % len(SECTOR_PALETTE)] for i, sec in enumerate(s)}
+
+
+def _rgba(hex_color: str, a: float) -> str:
+    h = hex_color.lstrip("#")
+    return f"rgba({int(h[0:2],16)},{int(h[2:4],16)},{int(h[4:6],16)},{a})"
+
+
+def _fmt_val(v, fmt: str) -> str:
+    if v is None or (isinstance(v, float) and np.isnan(v)):
+        return "—"
+    if fmt == "pct":    return f"{v * 100:.1f}%"   # decimal-stored ratio
+    if fmt == "pctraw": return f"{v:.2f}%"          # already in percent units
+    if fmt == "mult":   return f"{v:.1f}x"
+    if fmt == "pts":    return f"{v:.0f}"
+    return f"{v:.2f}"
+
+
+def _hover_num(var: str, fmt: str) -> str:
+    """d3-format hover token for a Plotly axis/customdata variable."""
+    if fmt == "pct":    return "%{" + var + ":.1%}"
+    if fmt == "pctraw": return "%{" + var + ":.2f}%"
+    if fmt == "mult":   return "%{" + var + ":.1f}x"
+    if fmt == "pts":    return "%{" + var + ":.0f}"
+    return "%{" + var + ":.3g}"
+
+
+@st.cache_data(ttl=3600)
+def load_universe() -> pd.DataFrame:
+    """Latest snapshot cross-section for the whole universe, joined to companies
+    for GICS sector + company_name, with the 2 derived metrics added. Loaded once."""
+    cl = get_client()
+    latest = (cl.table("fundamentals_snapshot").select("snapshot_date")
+              .order("snapshot_date", desc=True).limit(1).execute().data)
+    if not latest:
+        return pd.DataFrame()
+    snap_date = latest[0]["snapshot_date"]
+
+    cols = "ticker,snapshot_date,market_cap,cfo_ttm," + ",".join(DIRECT_METRIC_KEYS)
+    rows, start = [], 0
+    while True:
+        batch = (cl.table("fundamentals_snapshot").select(cols)
+                 .eq("snapshot_date", snap_date).range(start, start + 999).execute().data)
+        rows += batch
+        if len(batch) < 1000:
+            break
+        start += 1000
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+
+    comp = pd.DataFrame(cl.table("companies")
+                        .select("ticker,company_name,sector,is_active").execute().data)
+    comp = comp[comp["is_active"] == True]                       # noqa: E712
+    comp = comp[comp["sector"].notna()][["ticker", "company_name", "sector"]]
+    df = df.merge(comp, on="ticker", how="inner")
+
+    for c in DIRECT_METRIC_KEYS + ["market_cap", "cfo_ttm"]:
+        df[c] = pd.to_numeric(df[c], errors="coerce")
+
+    # Derived metrics (same rules as sector_stats.py)
+    df["earnings_yield"] = np.where(df["pe_ratio"] > 0, 1.0 / df["pe_ratio"], np.nan)
+    df["p_ocf"] = np.where(df["cfo_ttm"] > 0, df["market_cap"] / df["cfo_ttm"], np.nan)
+    return df
+
+
+def _explorer_boxplot(view: pd.DataFrame, metric_key: str, log_scale: bool, clip: bool) -> None:
+    label = METRIC_LABEL[metric_key]
+    sub = view[["sector", metric_key]].dropna(subset=[metric_key])
+    dropped = len(view) - len(sub)
+    note = ""
+    if log_scale:
+        before = len(sub)
+        sub = sub[sub[metric_key] > 0]
+        hidden = before - len(sub)
+        if hidden:
+            note = f" · {hidden} non-positive hidden (log)"
+    if sub.empty:
+        st.info("No data for this metric in the current selection.")
+        return
+
+    sectors = sorted(sub["sector"].unique())
+    colors = _sector_colors(sectors)
+    horizontal = len(sectors) > 6
+    cat_var = "y" if horizontal else "x"
+    hovertemplate = (
+        "<b>%{" + cat_var + "}</b><br>"
+        "Median: %{median:.3g}<br>"
+        "P25: %{q1:.3g} · P75: %{q3:.3g}<br>"
+        "n = %{customdata[0]}<extra></extra>"
+    )
+
+    fig = go.Figure()
+    for s in sectors:
+        vals = sub.loc[sub["sector"] == s, metric_key].to_numpy(float)
+        q1, med, q3 = np.percentile(vals, [25, 50, 75])
+        lo, hi = (np.percentile(vals, [5, 95]) if clip else (vals.min(), vals.max()))
+        common = dict(
+            name=s, fillcolor=_rgba(colors[s], 0.35), line=dict(color=colors[s], width=1.5),
+            q1=[q1], median=[med], q3=[q3], lowerfence=[float(lo)], upperfence=[float(hi)],
+            customdata=[[int(vals.size)]], hovertemplate=hovertemplate, whiskerwidth=0.4,
+        )
+        fig.add_trace(go.Box(y=[s], orientation="h", **common) if horizontal
+                      else go.Box(x=[s], **common))
+
+    stat_axis = dict(title=label, gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR,
+                     type="log" if log_scale else "linear")
+    cat_axis = dict(title="", gridcolor=GRID_COLOR)
+    layout = dict(template=PLOTLY_THEME, height=460, showlegend=False,
+                  margin=dict(l=0, r=0, t=40, b=0), paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR,
+                  title=dict(text=f"{label} — distribution by sector", font=dict(size=14)))
+    layout["xaxis"], layout["yaxis"] = ((stat_axis, cat_axis) if horizontal else (cat_axis, stat_axis))
+    fig.update_layout(**layout)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"{len(sub)} companies · {dropped} null dropped{note}")
+
+
+def _explorer_histogram(view: pd.DataFrame, metric_key: str, nbins: int, mode: str) -> None:
+    label = METRIC_LABEL[metric_key]
+    sub = view[["sector", metric_key]].dropna(subset=[metric_key])
+    dropped = len(view) - len(sub)
+    if sub.empty:
+        st.info("No data for this metric in the current selection.")
+        return
+
+    vals_all = sub[metric_key].to_numpy(float)
+    edges = np.histogram_bin_edges(vals_all, bins=nbins)
+    centers = (edges[:-1] + edges[1:]) / 2
+    widths = np.diff(edges)
+    total = vals_all.size
+    median_all = float(np.median(vals_all))
+
+    def make_bar(vals, name, color):
+        counts, _ = np.histogram(vals, bins=edges)
+        customdata = np.column_stack([edges[:-1], edges[1:], counts / total * 100.0])
+        return go.Bar(
+            x=centers, y=counts, width=widths, name=name, marker_color=color, customdata=customdata,
+            hovertemplate=("Range: %{customdata[0]:.3g} – %{customdata[1]:.3g}<br>"
+                           "Count: %{y}<br>% of universe: %{customdata[2]:.1f}%"
+                           "<extra>" + name + "</extra>"),
+        )
+
+    fig = go.Figure()
+    if mode == "Single distribution":
+        fig.add_trace(make_bar(vals_all, "All", BLUE))
+        barmode, opacity = "overlay", 1.0
+    else:
+        colors = _sector_colors(sub["sector"].unique())
+        for s in sorted(colors):
+            v = sub.loc[sub["sector"] == s, metric_key].to_numpy(float)
+            if v.size:
+                fig.add_trace(make_bar(v, s, colors[s]))
+        barmode, opacity = (("stack", 1.0) if mode == "By sector (stacked)" else ("overlay", 0.55))
+
+    fig.update_traces(opacity=opacity)
+    fig.add_vline(x=median_all, line=dict(color="#ffffff", dash="dash", width=1.5),
+                  annotation_text="universe median " + _fmt_val(median_all, METRIC_FMT[metric_key]),
+                  annotation_position="top right")
+    fig.update_layout(template=PLOTLY_THEME, height=460, barmode=barmode, bargap=0.02,
+                      margin=dict(l=0, r=0, t=30, b=0), paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR,
+                      xaxis_title=label, yaxis_title="Companies",
+                      legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                                  font=dict(size=11)))
+    fig.update_xaxes(gridcolor=GRID_COLOR)
+    fig.update_yaxes(gridcolor=GRID_COLOR)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"{total} companies · {nbins} bins · {dropped} null dropped")
+
+
+def _explorer_bubble(view, x_key, y_key, size_key, per_sector, logx, logy) -> None:
+    xlabel, ylabel = METRIC_LABEL[x_key], METRIC_LABEL[y_key]
+    size_is_mcap = size_key == "market_cap"
+    sizelabel = "Market Cap" if size_is_mcap else METRIC_LABEL[size_key]
+
+    sub = view.dropna(subset=list({x_key, y_key, size_key})).copy()
+    dropped = len(view) - len(sub)
+    before = len(sub)
+    sub = sub[sub[size_key] > 0]                       # area sizing needs positive
+    size_dropped = before - len(sub)
+    if sub.empty:
+        st.info("No data for this combination in the current selection.")
+        return
+
+    colors = _sector_colors(sub["sector"].unique())
+
+    def size_disp(series):
+        if size_is_mcap:
+            return series.map(fmt_large)
+        return series.map(lambda v: _fmt_val(v, METRIC_FMT[size_key]))
+
+    fig = go.Figure()
+    if per_sector:
+        g = (sub.groupby("sector")
+             .agg(x=(x_key, "median"), y=(y_key, "median"), sz=(size_key, "median"),
+                  n=("ticker", "count")).reset_index())
+        sizeref = 2.0 * g["sz"].max() / (55.0 ** 2)
+        g["sz_disp"] = size_disp(g["sz"])
+        ht = ("<b>%{customdata[0]}</b> (median of %{customdata[1]} cos)<br>"
+              + xlabel + ": " + _hover_num("x", METRIC_FMT[x_key]) + "<br>"
+              + ylabel + ": " + _hover_num("y", METRIC_FMT[y_key]) + "<br>"
+              + "median " + sizelabel + ": %{customdata[2]}<extra></extra>")
+        for _, r in g.iterrows():
+            s = r["sector"]
+            fig.add_trace(go.Scatter(
+                x=[r["x"]], y=[r["y"]], mode="markers+text", name=s, text=[s],
+                textposition="top center", textfont=dict(size=10, color="#cccccc"),
+                marker=dict(size=[r["sz"]], sizemode="area", sizeref=sizeref, sizemin=6,
+                            color=colors[s], line=dict(width=1, color=BG_COLOR), opacity=0.85),
+                customdata=[[s, int(r["n"]), r["sz_disp"]]], hovertemplate=ht, showlegend=False))
+    else:
+        sizeref = 2.0 * sub[size_key].max() / (45.0 ** 2)
+        ht = ("<b>%{customdata[0]}</b> — %{customdata[1]}<br>%{customdata[2]}<br>"
+              + xlabel + ": " + _hover_num("x", METRIC_FMT[x_key]) + "<br>"
+              + ylabel + ": " + _hover_num("y", METRIC_FMT[y_key]) + "<br>"
+              + sizelabel + ": %{customdata[3]}<extra></extra>")
+        for s in sorted(colors):
+            d = sub[sub["sector"] == s]
+            cd = list(zip(d["ticker"], d["company_name"], [s] * len(d), size_disp(d[size_key])))
+            fig.add_trace(go.Scatter(
+                x=d[x_key], y=d[y_key], mode="markers", name=s,
+                marker=dict(size=d[size_key], sizemode="area", sizeref=sizeref, sizemin=3,
+                            color=colors[s], line=dict(width=0.4, color=BG_COLOR), opacity=0.75),
+                customdata=cd, hovertemplate=ht))
+
+    med_x, med_y = float(sub[x_key].median()), float(sub[y_key].median())
+    fig.add_vline(x=med_x, line=dict(color="rgba(255,255,255,0.25)", dash="dot", width=1))
+    fig.add_hline(y=med_y, line=dict(color="rgba(255,255,255,0.25)", dash="dot", width=1))
+
+    fig.update_layout(template=PLOTLY_THEME, height=560, margin=dict(l=0, r=0, t=10, b=0),
+                      paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR,
+                      xaxis_title=xlabel, yaxis_title=ylabel,
+                      legend=dict(orientation="h", yanchor="bottom", y=1.01, xanchor="left", x=0,
+                                  font=dict(size=11)))
+    fig.update_xaxes(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR, type="log" if logx else "linear")
+    fig.update_yaxes(gridcolor=GRID_COLOR, zerolinecolor=GRID_COLOR, type="log" if logy else "linear")
+    st.plotly_chart(fig, use_container_width=True)
+    cap = f"{len(sub)} companies plotted · {dropped} null dropped"
+    if size_dropped:
+        cap += f" · {size_dropped} non-positive {sizelabel} dropped"
+    st.caption(cap)
+
+
+def _explorer_summary(view: pd.DataFrame, primary_key: str, secondary_key: str | None = None) -> None:
+    label = METRIC_LABEL[primary_key]
+    fmt = METRIC_FMT[primary_key]
+    sub = view.dropna(subset=[primary_key])
+
+    cols = st.columns(3 if secondary_key else 2)
+    cols[0].metric("Companies", f"{len(sub)}")
+    cols[1].metric(f"Median {label}",
+                   _fmt_val(sub[primary_key].median(), fmt) if len(sub) else "—")
+    if secondary_key:
+        sub2 = view.dropna(subset=[secondary_key])
+        cols[2].metric(f"Median {METRIC_LABEL[secondary_key]}",
+                       _fmt_val(sub2[secondary_key].median(), METRIC_FMT[secondary_key])
+                       if len(sub2) else "—")
+    if sub.empty:
+        return
+
+    def tbl(frame):
+        out = frame[["ticker", "company_name", "sector", primary_key]].copy()
+        out[label] = out[primary_key].map(lambda v: _fmt_val(v, fmt))
+        out = (out.drop(columns=[primary_key])
+               .rename(columns={"ticker": "Ticker", "company_name": "Company", "sector": "Sector"}))
+        return out
+
+    hi, lo = st.columns(2)
+    with hi:
+        st.caption(f"⬆ Highest {label}")
+        st.dataframe(tbl(sub.nlargest(5, primary_key)), hide_index=True, use_container_width=True)
+    with lo:
+        st.caption(f"⬇ Lowest {label}")
+        st.dataframe(tbl(sub.nsmallest(5, primary_key)), hide_index=True, use_container_width=True)
+
+
+with tab7:
+    st.subheader("🔭 Universe Explorer")
+    uni = load_universe()
+
+    if uni.empty:
+        st.warning(
+            "No universe data yet. Apply migrations **008**/**009** and run "
+            "`python3 refresh_all.py` (or `sector_stats.py` + `company_ranks.py`)."
+        )
+    else:
+        all_sectors = sorted(uni["sector"].unique())
+        st.caption(
+            f"{len(uni)} companies · {len(all_sectors)} GICS sectors · "
+            f"snapshot {uni['snapshot_date'].iloc[0]}"
+        )
+
+        v_box, v_hist, v_bub = st.tabs(["📊 Box Plot", "📈 Histogram", "🎯 Bubble Chart"])
+
+        # ── Box Plot ──────────────────────────────────────────────────────────
+        with v_box:
+            a, b = st.columns([3, 3])
+            m = a.selectbox("Metric", METRIC_KEYS, key="ue_box_metric",
+                            format_func=lambda k: METRIC_LABEL[k])
+            secs = b.multiselect("Sectors", all_sectors, default=all_sectors, key="ue_box_secs")
+            c, d = st.columns([3, 3])
+            clip = c.radio("Outliers", ["Clip above P95", "Show all"],
+                           key="ue_box_clip", horizontal=True) == "Clip above P95"
+            logs = d.radio("Scale", ["Linear", "Log"],
+                           key="ue_box_scale", horizontal=True) == "Log"
+            vbox = uni[uni["sector"].isin(secs)] if secs else uni
+            _explorer_boxplot(vbox, m, logs, clip)
+            _explorer_summary(vbox, m)
+
+        # ── Histogram ─────────────────────────────────────────────────────────
+        with v_hist:
+            a, b = st.columns([3, 3])
+            m = a.selectbox("Metric", METRIC_KEYS, key="ue_hist_metric",
+                            format_func=lambda k: METRIC_LABEL[k])
+            secs = b.multiselect("Sectors", all_sectors, default=all_sectors, key="ue_hist_secs")
+            c, d = st.columns([3, 3])
+            nbins = c.slider("Bins", 10, 50, 25, key="ue_hist_bins")
+            mode = d.radio("Overlay",
+                           ["Single distribution", "By sector (stacked)", "By sector (overlaid)"],
+                           key="ue_hist_mode")
+            vh = uni[uni["sector"].isin(secs)] if secs else uni
+            _explorer_histogram(vh, m, nbins, mode)
+            _explorer_summary(vh, m)
+
+        # ── Bubble Chart ──────────────────────────────────────────────────────
+        with v_bub:
+            a, b, c = st.columns(3)
+            xk = a.selectbox("X-axis", METRIC_KEYS, index=METRIC_KEYS.index("roic"),
+                             key="ue_bub_x", format_func=lambda k: METRIC_LABEL[k])
+            yk = b.selectbox("Y-axis", METRIC_KEYS, index=METRIC_KEYS.index("dividend_yield"),
+                             key="ue_bub_y", format_func=lambda k: METRIC_LABEL[k])
+            size_opts = ["market_cap"] + METRIC_KEYS
+            sk = c.selectbox("Size", size_opts, index=0, key="ue_bub_size",
+                             format_func=lambda k: "Market Cap" if k == "market_cap" else METRIC_LABEL[k])
+            d, e, f = st.columns(3)
+            secs = d.multiselect("Sectors", all_sectors, default=all_sectors, key="ue_bub_secs")
+            grp = e.radio("Grouping", ["One bubble per company", "One bubble per sector"],
+                          key="ue_bub_grp")
+            logx = f.checkbox("Log X", key="ue_bub_logx")
+            logy = f.checkbox("Log Y", key="ue_bub_logy")
+            vb = uni[uni["sector"].isin(secs)] if secs else uni
+            _explorer_bubble(vb, xk, yk, sk, grp == "One bubble per sector", logx, logy)
+            _explorer_summary(vb, xk, yk)
+
+
+# ════════════════════════════════════════════════════════════════════════════════
+# TAB 8 — RULES FILTER  (Stage 2b — Buffett-inspired rule engine)
+# ════════════════════════════════════════════════════════════════════════════════
+# Reads pre-computed pass/fail results from rule_results (written by rule_engine.py)
+# and presents the shortlist / watchlist / rejected lists plus a filter-diagnostics
+# view. Independent of the sidebar ticker — operates over the whole universe.
+
+# (rule_id, db_column, category, label) — mirrors rule_engine.RULES. 3.3 is the
+# deferred placeholder (always N/A) and is excluded from the active rule set.
+RULE_DEFS = [
+    ("1.1", "rule_1_1", "Quality",    "Operating history"),
+    ("1.2", "rule_1_2", "Quality",    "Earnings consistency"),
+    ("1.3", "rule_1_3", "Quality",    "ROIC vs sector & ≥8%"),
+    ("1.4", "rule_1_4", "Quality",    "Gross-margin trend"),
+    ("2.1", "rule_2_1", "Financial",  "Net debt / EBITDA"),
+    ("2.2", "rule_2_2", "Financial",  "Interest coverage ≥5×"),
+    ("2.3", "rule_2_3", "Financial",  "FCF consistency"),
+    ("3.1", "rule_3_1", "Valuation",  "FCF yield vs sector"),
+    ("3.2", "rule_3_2", "Valuation",  "EV/EBITDA vs sector"),
+    ("3.3", "rule_3_3", "Valuation",  "Margin of safety (deferred)"),
+    ("4.1", "rule_4_1", "Trajectory", "Revenue growth vs sector"),
+    ("4.2", "rule_4_2", "Trajectory", "Capital-return discipline"),
+]
+ACTIVE_RULE_DEFS = [d for d in RULE_DEFS if d[0] != "3.3"]   # the 11 active rules
+ACTIVE_RULE_IDS  = [d[0] for d in ACTIVE_RULE_DEFS]
+ALL_RULE_COLS    = [d[1] for d in RULE_DEFS]
+
+RULE_CAT_COLOR = {
+    "Quality":    BLUE,
+    "Financial":  GREEN,
+    "Valuation":  "#f0b429",
+    "Trajectory": "#b794f4",
+}
+CATEGORY_BADGE = {
+    "shortlist": ("✅", GREEN),
+    "watchlist": ("👀", "#f0b429"),
+    "rejected":  ("❌", RED),
+}
+
+
+@st.cache_data(ttl=3600)
+def load_rule_results() -> pd.DataFrame:
+    """Latest batch of rule_results (one row per ticker), rule columns coerced to
+    pandas nullable boolean so True / False / <NA> survive intact."""
+    cl = get_client()
+    latest = (cl.table("rule_results").select("calculated_at")
+              .order("calculated_at", desc=True).limit(1).execute().data)
+    if not latest:
+        return pd.DataFrame()
+    cal = latest[0]["calculated_at"]
+
+    rows, start = [], 0
+    while True:
+        batch = (cl.table("rule_results").select("*")
+                 .eq("calculated_at", cal).range(start, start + 999).execute().data)
+        rows += batch
+        if len(batch) < 1000:
+            break
+        start += 1000
+
+    df = pd.DataFrame(rows)
+    if df.empty:
+        return df
+    for col in ALL_RULE_COLS:
+        if col in df.columns:
+            df[col] = df[col].astype("boolean")
+    df["pass_pct"]         = pd.to_numeric(df["pass_pct"], errors="coerce")
+    df["passed_count"]     = pd.to_numeric(df["passed_count"], errors="coerce").astype(int)
+    df["applicable_count"] = pd.to_numeric(df["applicable_count"], errors="coerce").astype(int)
+
+    # company_name isn't persisted in rule_results (the spec's schema omits it) —
+    # join it from companies, falling back to the ticker when a name is missing.
+    names = {c["ticker"]: c.get("company_name")
+             for c in cl.table("companies").select("ticker,company_name").execute().data}
+    df["company_name"] = df["ticker"].map(names).fillna(df["ticker"])
+    return df
+
+
+def _bool_symbol(v) -> str:
+    if v is True:
+        return "✓"
+    if v is False:
+        return "✗"
+    return "—"
+
+
+def _is_false(v) -> bool:
+    """Robust 'explicit False' test across Python bool / numpy bool_ / pd.NA."""
+    return False if pd.isna(v) else (not bool(v))
+
+
+def _failed_rule_ids(row) -> list[str]:
+    """Active rule ids the company explicitly FAILED (False, not N/A)."""
+    return [rid for rid, col, _, _ in ACTIVE_RULE_DEFS if _is_false(row[col])]
+
+
+def _rules_table(sub: pd.DataFrame, show_failed: bool = False,
+                 show_category: bool = False) -> pd.DataFrame:
+    """Build the display table: identity + 11 rule columns (✓/✗/—) + counts."""
+    disp = pd.DataFrame()
+    disp["Ticker"]  = sub["ticker"].values
+    disp["Company"] = sub["company_name"].values
+    disp["Sector"]  = sub["sector"].values
+    if show_category:
+        disp["Category"] = sub["category"].values
+    disp["Appl."]   = sub["applicable_count"].values
+    for rid, col, _, _ in ACTIVE_RULE_DEFS:
+        disp[rid] = [_bool_symbol(v) for v in sub[col]]
+    disp["Passed"]  = sub["passed_count"].values
+    disp["Pass %"]  = (sub["pass_pct"] * 100).round(0).values
+    if show_failed:
+        disp["Failed rules"] = [", ".join(_failed_rule_ids(r)) for _, r in sub.iterrows()]
+    return disp
+
+
+def _universe_rule_stats(df: pd.DataFrame) -> dict:
+    """Per-rule universe stats: rid -> {rate, passed, applicable, failed, cat, label}.
+    Computed over the FULL universe (unfiltered) so the 'how much it filters'
+    context is stable regardless of the on-screen filter."""
+    out = {}
+    for rid, col, cat, label in ACTIVE_RULE_DEFS:
+        applicable = int(df[col].notna().sum())
+        passed = int((df[col] == True).sum())                       # noqa: E712
+        failed = int((df[col] == False).sum())                      # noqa: E712
+        rate = (passed / applicable * 100) if applicable else 0.0
+        out[rid] = dict(rate=rate, passed=passed, applicable=applicable,
+                        failed=failed, cat=cat, label=label)
+    return out
+
+
+def _rule_column_config(stats: dict) -> dict:
+    """st.column_config giving each rule header (1.1, 1.2, …) a hover tooltip with
+    what it tests, its category, and how strongly it filters the universe."""
+    cfg = {}
+    for rid, col, cat, label in ACTIVE_RULE_DEFS:
+        s = stats[rid]
+        cfg[rid] = st.column_config.TextColumn(
+            rid, width="small",
+            help=(f"**{label}** · {cat}  \n"
+                  f"{s['rate']:.0f}% of the universe passes "
+                  f"({s['passed']}/{s['applicable']} applicable, {s['failed']} fail). "
+                  f"Lower % = filters more. ✓ pass · ✗ fail · — N/A."),
+        )
+    cfg["Pass %"] = st.column_config.NumberColumn("Pass %", format="%d%%")
+    return cfg
+
+
+def _rule_reference(stats: dict) -> None:
+    """Reference table: what each rule tests + how strongly it filters the
+    universe, most-critical (lowest pass rate) first."""
+    ref = pd.DataFrame([
+        {"Rule": rid, "Category": stats[rid]["cat"], "Tests": label,
+         "Universe pass %": round(stats[rid]["rate"]),
+         "Failing": stats[rid]["failed"], "Applicable": stats[rid]["applicable"]}
+        for rid, col, cat, label in ACTIVE_RULE_DEFS
+    ]).sort_values("Universe pass %")
+    st.dataframe(
+        ref, hide_index=True, use_container_width=True,
+        height=60 + 35 * len(ref),
+        column_config={
+            "Universe pass %": st.column_config.ProgressColumn(
+                "Universe pass %", format="%d%%", min_value=0, max_value=100),
+        })
+    st.caption("Sorted **most-critical first**: a low pass % means the rule rejects many "
+               "companies (heavy filtering); a rule near 100% barely filters. Rule 3.3 "
+               "(margin of safety) is deferred and omitted. See *Filter Diagnostics* for "
+               "the marginal-removal and co-failure views.")
+
+
+def _category_panel(df: pd.DataFrame, category: str, *, show_failed: bool,
+                    empty_msg: str, key: str, colcfg: dict) -> None:
+    """Shared renderer for the Shortlist / Watchlist / Rejected sub-tabs."""
+    sub = (df[df["category"] == category]
+           .sort_values(["pass_pct", "passed_count"], ascending=False, na_position="last"))
+    icon, color = CATEGORY_BADGE[category]
+    st.markdown(f"#### {icon} {category.capitalize()} — "
+                f"<span style='color:{color}'>{len(sub)}</span> companies",
+                unsafe_allow_html=True)
+    if sub.empty:
+        st.info(empty_msg)
+        return
+    table = _rules_table(sub, show_failed=show_failed)
+    st.dataframe(table, hide_index=True, use_container_width=True,
+                 height=min(560, 60 + 35 * len(table)), column_config=colcfg)
+    st.caption("Hover a rule header (1.1, 1.2, …) for what it tests + how much it filters. "
+               "✓ pass · ✗ fail · — not applicable.")
+    st.download_button("⬇  Download CSV", table.to_csv(index=False),
+                       file_name=f"{category}.csv", mime="text/csv", key=f"dl_{key}")
+
+
+def _all_panel(df: pd.DataFrame, colcfg: dict) -> None:
+    """Full table of every company (all categories), with a Category column."""
+    sub = df.sort_values(["pass_pct", "passed_count"], ascending=False, na_position="last")
+    st.markdown(f"#### 📋 All companies — <span style='color:{BLUE}'>{len(sub)}</span>",
+                unsafe_allow_html=True)
+    if sub.empty:
+        st.info("No companies match the current filter.")
+        return
+    table = _rules_table(sub, show_failed=True, show_category=True)
+    st.dataframe(table, hide_index=True, use_container_width=True,
+                 height=min(680, 60 + 35 * len(table)), column_config=colcfg)
+    st.caption("Hover a rule header for what it tests + how much it filters. Click any "
+               "column header to sort. ✓ pass · ✗ fail · — not applicable.")
+    st.download_button("⬇  Download CSV", table.to_csv(index=False),
+                       file_name="all_companies.csv", mime="text/csv", key="dl_all")
+
+
+def _diag_pass_rates(df: pd.DataFrame) -> None:
+    """D1 — per-rule pass rate across the universe, colored by category."""
+    rows = []
+    for rid, col, cat, label in ACTIVE_RULE_DEFS:
+        applicable = int(df[col].notna().sum())
+        passed = int((df[col] == True).sum())                       # noqa: E712
+        rate = (passed / applicable * 100) if applicable else 0.0
+        rows.append((rid, label, cat, rate, passed, applicable))
+
+    # Keep rule order (grouped by category); reverse so 1.1 is at the top bar.
+    rows = rows[::-1]
+    fig = go.Figure(go.Bar(
+        x=[r[3] for r in rows],
+        y=[f"{r[0]}  {r[1]}" for r in rows],
+        orientation="h",
+        marker_color=[RULE_CAT_COLOR[r[2]] for r in rows],
+        customdata=[[r[4], r[5]] for r in rows],
+        text=[f"{r[3]:.0f}%  ({r[4]}/{r[5]})" for r in rows],
+        textposition="outside",
+        hovertemplate="%{y}<br>Pass rate: %{x:.1f}%<br>"
+                      "%{customdata[0]} of %{customdata[1]} applicable<extra></extra>",
+    ))
+    fig.update_layout(template=PLOTLY_THEME, height=460, margin=dict(l=0, r=0, t=10, b=0),
+                      paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR,
+                      xaxis_title="% of applicable companies passing", xaxis_range=[0, 109])
+    fig.update_xaxes(gridcolor=GRID_COLOR, ticksuffix="%")
+    fig.update_yaxes(gridcolor=GRID_COLOR)
+    st.plotly_chart(fig, use_container_width=True)
+    # Category legend
+    st.caption(" · ".join(
+        f"<span style='color:{c}'>■</span> {cat}"
+        for cat, c in RULE_CAT_COLOR.items()), unsafe_allow_html=True)
+
+
+def _diag_marginal(df: pd.DataFrame) -> None:
+    """D2 — shortlist size if each rule alone were removed (others still applied)."""
+    elig = df[df["applicable_count"] > 0]
+    fsets = [set(_failed_rule_ids(r)) for _, r in elig.iterrows()]
+    base = sum(1 for fs in fsets if not fs)            # current shortlist size
+
+    rows = []
+    for rid, _, cat, label in ACTIVE_RULE_DEFS:
+        # A company joins the shortlist when R is removed iff its only failures ⊆ {R}.
+        without = sum(1 for fs in fsets if fs <= {rid})
+        rows.append((rid, label, cat, without, without - base))
+
+    rows.sort(key=lambda r: r[3])                      # ascending → biggest at top
+    fig = go.Figure(go.Bar(
+        x=[r[3] for r in rows],
+        y=[f"{r[0]}  {r[1]}" for r in rows],
+        orientation="h",
+        marker_color=[RULE_CAT_COLOR[r[2]] for r in rows],
+        customdata=[[r[4]] for r in rows],
+        text=[(f"{r[3]}  (+{r[4]})" if r[4] else f"{r[3]}") for r in rows],
+        textposition="outside",
+        hovertemplate="%{y}<br>Shortlist without this rule: %{x}<br>"
+                      "Added vs current: +%{customdata[0]}<extra></extra>",
+    ))
+    fig.add_vline(x=base, line=dict(color="#ffffff", dash="dash", width=1.5),
+                  annotation_text=f"current shortlist = {base}",
+                  annotation_position="top")
+    xmax = max((r[3] for r in rows), default=1)
+    fig.update_layout(template=PLOTLY_THEME, height=460, margin=dict(l=0, r=0, t=20, b=0),
+                      paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR,
+                      xaxis_title="Shortlist size if this rule were removed",
+                      xaxis_range=[0, xmax * 1.18 + 1])
+    fig.update_xaxes(gridcolor=GRID_COLOR)
+    fig.update_yaxes(gridcolor=GRID_COLOR)
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption(f"Current shortlist holds **{base}** companies. A long bar = removing that "
+               "rule alone would admit many more — i.e. it is doing most of the filtering.")
+
+
+def _diag_heatmap(df: pd.DataFrame) -> None:
+    """D3 — 11×11 co-failure matrix. Cell (i,j) = # companies failing both i and j;
+    the diagonal = # failing rule i."""
+    ids = ACTIVE_RULE_IDS
+    idx = {rid: i for i, rid in enumerate(ids)}
+    n = len(ids)
+    M = np.zeros((n, n), dtype=int)
+    for _, r in df.iterrows():
+        fl = _failed_rule_ids(r)
+        for a in fl:
+            for b in fl:
+                M[idx[a]][idx[b]] += 1
+
+    fig = go.Figure(go.Heatmap(
+        z=M, x=ids, y=ids, colorscale="Blues", zmin=0,
+        text=M, texttemplate="%{text}", textfont=dict(size=10),
+        hovertemplate="Fail %{y} AND %{x}: %{z} companies<extra></extra>",
+        colorbar=dict(title="cos"),
+    ))
+    fig.update_layout(template=PLOTLY_THEME, height=520, margin=dict(l=0, r=0, t=10, b=0),
+                      paper_bgcolor=BG_COLOR, plot_bgcolor=BG_COLOR,
+                      xaxis_title="Rule", yaxis_title="Rule")
+    fig.update_yaxes(autorange="reversed")
+    st.plotly_chart(fig, use_container_width=True)
+    st.caption("Diagonal = how many companies fail each rule. Off-diagonal = how many "
+               "fail **both** — bright off-diagonal cells are rules that tend to reject "
+               "the same names (redundant), dark ones catch different companies.")
+
+
+with tab8:
+    st.subheader("🎯 Rules Filter")
+    st.caption("Buffett-inspired hard pass/fail screen — 11 rules with sector-aware "
+               "exemptions. No scoring or weights.")
+    rr = load_rule_results()
+
+    if rr.empty:
+        st.warning(
+            "No rule results yet. Apply migration **010** and run "
+            "`python3 rule_engine.py` (or the full `python3 refresh_all.py`)."
+        )
+    else:
+        cats = rr["category"].value_counts()
+        c1, c2, c3, c4 = st.columns(4)
+        c1.metric("Universe", len(rr))
+        c2.metric("✅ Shortlist", int(cats.get("shortlist", 0)))
+        c3.metric("👀 Watchlist", int(cats.get("watchlist", 0)))
+        c4.metric("❌ Rejected", int(cats.get("rejected", 0)))
+
+        # Per-rule universe stats (unfiltered) drive the header tooltips + reference.
+        stats  = _universe_rule_stats(rr)
+        colcfg = _rule_column_config(stats)
+
+        # ── Filter: search by ticker/company + sector multiselect (applies to the
+        #    list sub-tabs; the Diagnostics view always uses the full universe). ──
+        fc1, fc2 = st.columns([2, 3])
+        q = fc1.text_input("🔎 Search ticker or company", key="rules_search",
+                           placeholder="e.g. AAPL or Apple").strip().lower()
+        all_sectors = sorted(rr["sector"].dropna().unique())
+        picked = fc2.multiselect("Filter by sector", all_sectors, default=[],
+                                 key="rules_sector")
+        rr_f = rr
+        if q:
+            rr_f = rr_f[rr_f["ticker"].str.lower().str.contains(q, na=False) |
+                        rr_f["company_name"].str.lower().str.contains(q, na=False)]
+        if picked:
+            rr_f = rr_f[rr_f["sector"].isin(picked)]
+        if len(rr_f) != len(rr):
+            st.caption(f"Filter active — **{len(rr_f)}** of {len(rr)} companies match "
+                       "(the lists below are filtered; Diagnostics stays universe-wide).")
+
+        sub_all, sub_a, sub_b, sub_c, sub_d = st.tabs([
+            "📋 All", "✅ Shortlist", "👀 Watchlist", "❌ Rejected", "🔍 Filter Diagnostics",
+        ])
+
+        with sub_all:
+            with st.expander("ℹ️  What each rule tests & how much it filters", expanded=False):
+                _rule_reference(stats)
+            _all_panel(rr_f, colcfg)
+
+        with sub_a:
+            _category_panel(
+                rr_f, "shortlist", show_failed=False, key="shortlist", colcfg=colcfg,
+                empty_msg="No company passed every applicable rule (in the current "
+                          "filter). Check the Diagnostics tab — usually one or two "
+                          "valuation rules are rejecting the whole universe at today's prices.")
+
+        with sub_b:
+            st.caption("Companies passing 80–99% of applicable rules. The **Failed "
+                       "rules** column flags what's holding each back — often a single "
+                       "valuation rule (great company, currently expensive).")
+            _category_panel(
+                rr_f, "watchlist", show_failed=True, key="watchlist", colcfg=colcfg,
+                empty_msg="No companies in the 80–99% band (in the current filter).")
+
+        with sub_c:
+            st.caption("Companies passing <80% of applicable rules, sorted so "
+                       "'almost-watchlist' names appear first.")
+            _category_panel(
+                rr_f, "rejected", show_failed=True, key="rejected", colcfg=colcfg,
+                empty_msg="Nothing rejected (in the current filter).")
+
+        with sub_d:
+            st.markdown("##### D1 · Per-rule pass rates")
+            st.caption("What share of the universe clears each rule (where it applies). "
+                       "A rule near 100% isn't really filtering; a very low one is doing "
+                       "heavy lifting.")
+            _diag_pass_rates(rr)
+
+            st.divider()
+            st.markdown("##### D2 · Marginal removal analysis")
+            st.caption("How big the shortlist becomes if each rule alone is dropped.")
+            _diag_marginal(rr)
+
+            st.divider()
+            st.markdown("##### D3 · Pairwise rule-interaction heatmap")
+            st.caption("Where rules co-reject the same companies.")
+            _diag_heatmap(rr)
+
+            st.divider()
+            st.markdown(
+                """
+**How to read these diagnostics**
+
+- **A rule with a 95%+ pass rate is barely filtering.** Everything clears it, so it
+  adds little signal — consider making it stricter or dropping it.
+- **If removing one rule dramatically grows the shortlist (a long D2 bar), that rule
+  is doing most of the filtering work.** Verify it tests what you intend before
+  trusting the screen — e.g. a single valuation rule can suppress the entire
+  shortlist when the whole market is expensive.
+- **Bright off-diagonal cells in D3 mean two rules reject the same names** (they're
+  partly redundant); **dark cells mean they catch different companies** (each earns
+  its place).
+""")
+

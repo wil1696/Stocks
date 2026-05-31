@@ -78,7 +78,7 @@ Required env vars:
 ### Core dashboard
 | File | Purpose |
 |---|---|
-| `dashboard.py` | Main Streamlit app — 5 tabs: Chart, Compare, Fundamentals, Valuation, Portfolio |
+| `dashboard.py` | Main Streamlit app — 8 tabs: Chart, Compare, Fundamentals, Valuation, Portfolio, AI Analysis, Universe Explorer, Rules Filter |
 | `indicators.py` | Technical indicators: moving averages, Bollinger Bands, RSI |
 | `valuation.py` | Valuation models: DCF, Reverse DCF, Graham Number, historical multiples, signal |
 
@@ -91,11 +91,12 @@ Required env vars:
 ### Data pipeline
 | File | Purpose |
 |---|---|
-| `refresh_all.py` | Orchestrates the daily refresh in order: fetch_stocks → save_fundamentals → sector_stats → company_ranks. Forwards universe flags to steps 1–2 only; stats/ranks always run over the full universe. |
+| `refresh_all.py` | Orchestrates the daily refresh in order: fetch_stocks → save_fundamentals → sector_stats → company_ranks → rule_engine. Forwards universe flags to steps 1–2 only; stats/ranks/rules always run over the full universe. |
 | `fetch_stocks.py` | Pulls 5yr daily OHLCV from yfinance → Supabase `stock_prices`. Universe-driven, resilient (retry+backoff), resumable. |
 | `save_fundamentals.py` | Pulls income, balance, cash flow, snapshot from yfinance → Supabase. Same resilience profile as `fetch_stocks.py`. |
 | `sector_stats.py` | Computes descriptive stats per (GICS sector × metric) over the latest snapshots → Supabase `sector_statistics`. numpy only; `--dry-run` / `--sector`. See "Stage 2a" below. |
 | `company_ranks.py` | Empirical percentile rank of each company vs its GICS-sector peers (0–100, 100 = best) → Supabase `company_ranks`. Reuses `sector_stats` loaders. |
+| `rule_engine.py` | Applies 11 Buffett-inspired pass/fail rules (sector-aware exemptions) → Supabase `rule_results`; classifies each company shortlist/watchlist/rejected. numpy/pandas only; `--dry-run` / `--tickers` / `--limit` / `--sector`. See "Stage 2b" below. |
 | `fundamentals.py` | `FundamentalsExtractor` — fetches and transforms fundamentals for one ticker. |
 | `universe.py` | Shared helper: `load_active_tickers()`, `add_universe_args()`, `resolve_tickers()`. The single entry point both pipelines use to decide which tickers to process. |
 | `seed_universe.py` | Pulls current S&P 500 from Wikipedia and upserts into `companies`. Soft-deletes dropped tickers (`is_active=FALSE`). Idempotent; run weekly. |
@@ -133,6 +134,7 @@ Tables created by `migrations/`:
 | `ai_analyses` | Pre-generated AI analyses (markdown); written by `save_analysis.py`, read by the dashboard. | grows on demand |
 | `sector_statistics` | Descriptive stats per (GICS sector, metric, calculated_at) — min/max/mean/median/std/mad/p10–p90 + sample_size. History-preserving (one batch per run). | ~209 / run |
 | `company_ranks` | Per-company percentile rank (0–100, 100 = best) per metric within GICS sector + raw_value. History-preserving. | ~9,000 / run |
+| `rule_results` | Per-company pass/fail per rule (BOOLEAN nullable; NULL = sector-exempt or missing data) + category (shortlist/watchlist/rejected), passed/applicable counts, pass_pct. History-preserving. | ~503 / run |
 
 Migrations (run in order against Supabase):
 - `migrations/001_create_stock_tables.sql` — `companies` + `stock_prices`
@@ -144,6 +146,7 @@ Migrations (run in order against Supabase):
 - `migrations/007_extend_companies_universe.sql` — extends `companies` with sector/sub_industry/date_added/is_active for the S&P 500 universe
 - `migrations/008_create_sector_statistics.sql` — `sector_statistics` (Stage 2a)
 - `migrations/009_create_company_ranks.sql` — `company_ranks` (Stage 2a)
+- `migrations/010_create_rule_results.sql` — `rule_results` + RLS/anon SELECT (Stage 2b)
 
 `companies.exchange` exists from migration 001 but is intentionally left NULL
 for seeded rows — nothing downstream reads it. Backfill only if expanding
@@ -159,6 +162,8 @@ beyond US markets.
 4. **📐 Valuation** — DCF with sliders, P/E + EV/EBITDA + P/S multiples, Reverse DCF, Graham Number, overall BUY/WATCH/AVOID signal
 5. **💼 Portfolio** — Add/edit/delete holdings, P&L per position, portfolio signal summary
 6. **🤖 AI Analysis** *(to be wired in)* — Full Claude-powered step-by-step analysis using `render_analysis_tab()` from `analysis_engine.py`
+7. **🔭 Universe Explorer** — Cross-universe box/histogram/bubble views of any metric, sector-filterable
+8. **🎯 Rules Filter** — Buffett-inspired pass/fail screen (Stage 2b): Shortlist / Watchlist / Rejected lists + Filter Diagnostics (per-rule pass rates, marginal-removal, co-failure heatmap). Reads `rule_results`.
 
 ---
 
@@ -259,6 +264,59 @@ ev_revenue, pb_ratio, dividend_yield, dividend_coverage`) + 2 derived on the fly
   EBITDA/gross profit and odd FCF (e.g. JPM `fcf_margin` ≈ −0.58 → rank ~2; no
   roic/gross_margin/ev_ebitda rows). Those near-worst ranks are correct-but-
   irrelevant; rank financials on P/B & ROE per the framework.
+
+---
+
+## Stage 2b — Buffett-inspired rule engine
+
+A hard pass/fail filter built on top of Stage 2a. Applies 11 rules (no scoring,
+no weights) to the full universe and classifies each company into
+**shortlist / watchlist / rejected**, plus a Filter Diagnostics view.
+
+**Pipeline (step 5 of `refresh_all.py`):** `company_ranks → rule_engine`.
+Runs over the full universe (no flag forwarding). Reads latest
+`fundamentals_snapshot` (joined to `companies.sector`/GICS), the annual
+income/balance/cashflow history, and `sector_statistics` medians (for the five
+sector-relative thresholds). Writes `rule_results` (history-preserving; latest
+batch via `MAX(calculated_at)`).
+
+**The 11 rules** (rule 3.3 is a deferred placeholder, always NULL, excluded from
+`applicable_count`):
+- **Quality:** 1.1 operating history (≥4 annual periods), 1.2 earnings
+  consistency (3-of-4 positive), 1.3 ROIC hybrid (3yr-avg ≥ sector median AND
+  ≥ 0.08), 1.4 gross-margin direction (latest ≥ t-3).
+- **Financial:** 2.1 net debt/EBITDA ≤ sector median × 1.25, 2.2 interest
+  coverage ≥ 5× (no debt → pass), 2.3 FCF consistency (3-of-4 positive).
+- **Valuation:** 3.1 FCF yield ≥ sector median, 3.2 EV/EBITDA ≤ sector median ×
+  1.25, **3.3 margin-of-safety vs DCF — DEFERRED**.
+- **Trajectory:** 4.1 revenue CAGR ≥ sector median, 4.2 capital-return
+  discipline (dividends every year OR declining share count).
+
+**Categorisation:** `pass_pct = passed / applicable`; `== 1.0 → shortlist`,
+`≥ 0.80 → watchlist`, else `rejected`.
+
+**Sector exemptions** (`RULE_NOT_APPLICABLE_FOR_SECTOR`): Financials are exempt
+from 1.3, 1.4, 2.1, 2.2, 3.1, 3.2 (banks use ROE/P&B, debt is the product, no
+EBITDA/gross profit). Exempt cells store `pd.NA` → SQL NULL, never False. REITs
+still run the standard rules (TODO: REIT-specific P/FFO/AFFO/NAV rules later).
+
+### Data conventions (verified against Supabase 2026-05-30; some differ from the spec)
+- **Rule 1.1** reads "4 years of quarterly statements" as **≥4 annual periods** —
+  yfinance only ever returns 5–8 quarters, never 16.
+- **`interest_expense` is stored POSITIVE**; **`capex` and `dividends_paid` are
+  stored NEGATIVE** (outflows). So FCF = `operating_cash_flow + capex`, and
+  "dividend paid" means `dividends_paid < 0`.
+- **`balance_sheets` has no shares column** → rule 4.2's buyback leg uses
+  `income_statements.shares_diluted` (fallback `shares_basic`), not
+  `shares_outstanding`.
+- N/A is three-valued: a rule returns True/False/None; None covers both
+  sector-exemption and missing data (the engine tallies which, per rule).
+
+**Dashboard:** the "🎯 Rules Filter" tab (tab 8) reads `rule_results` via the
+anon key. Migration 010 includes the RLS anon-SELECT policy + grant (same gotcha
+as Stage 2a — new tables aren't exposed to `anon` by default).
+
+**Run:** `python3 rule_engine.py [--dry-run|--tickers|--limit|--sector]`.
 
 ---
 
